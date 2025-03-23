@@ -1,0 +1,135 @@
+[
+  {
+    "object_id": 38,
+    "class_id": 7,
+    "confidence": 0.7607421875,
+    "marker_id": 1,
+    "first_seen": 1742718580.2510903,
+    "last_seen": 1742718580.2510903,
+    "duration": null,
+    "event": "no_entry",
+    "bbox": [
+      0.3625794013341268,
+      0.4607835981580946,
+      0.28617682456970217,
+      0.35001528704607926
+    ],
+    "id_rule_applied": 1,
+    "plate_text": null,
+    "province": null
+  },
+  {
+    "object_id": 46,
+    "class_id": 7,
+    "confidence": 0.6806640625,
+    "marker_id": 2,
+    "first_seen": 1742718585.2697356,
+    "last_seen": 1742718585.92796,
+    "duration": null,
+    "event": "wrong_way",
+    "bbox": [
+      0.3954074700673421,
+      0.4238674728958695,
+      0.22360283533732098,
+      0.2742137485080295
+    ],
+    "id_rule_applied": 3,
+    "plate_text": null,
+    "province": null
+  },
+  {
+    "object_id": 38,
+    "class_id": 7,
+    "confidence": 0.73095703125,
+    "marker_id": 2,
+    "first_seen": 1742718579.328258,
+    "last_seen": 1742718579.4807732,
+    "duration": null,
+    "event": "wrong_way",
+    "bbox": [
+      0.4366317590077718,
+      0.4124479364465784,
+      0.21280393600463868,
+      0.26894149780273435
+    ],
+    "id_rule_applied": 3,
+    "plate_text": "Unknown",
+    "province": "Unknown"
+  },
+  {
+    "object_id": 47,
+    "class_id": 2,
+    "confidence": 0.83984375,
+    "marker_id": 2,
+    "first_seen": 1742718591.9363916,
+    "last_seen": 1742718591.9545271,
+    "duration": null,
+    "event": "wrong_way",
+    "bbox": [
+      0.41859418551127114,
+      0.45867330763075087,
+      0.16365512212117514,
+      0.18754987363462094
+    ],
+    "id_rule_applied": 3,
+    "plate_text": null,
+    "province": null
+  },
+  {
+    "object_id": 47,
+    "class_id": 2,
+    "confidence": 0.8662109375,
+    "marker_id": 1,
+    "first_seen": 1742718592.2700217,
+    "last_seen": 1742718592.2700217,
+    "duration": null,
+    "event": "no_entry",
+    "bbox": [
+      0.3465602874755859,
+      0.5141625722249349,
+      0.21252333323160807,
+      0.23808359216760705
+    ],
+    "id_rule_applied": 1,
+    "plate_text": null,
+    "province": null
+  },
+  {
+    "object_id": 49,
+    "class_id": 7,
+    "confidence": 0.55078125,
+    "marker_id": 2,
+    "first_seen": 1742718598.199238,
+    "last_seen": 1742718598.2535477,
+    "duration": null,
+    "event": "wrong_way",
+    "bbox": [
+      0.46908790270487466,
+      0.44797258730287903,
+      0.22283747990926106,
+      0.20643451831958912
+    ],
+    "id_rule_applied": 3,
+    "plate_text": null,
+    "province": null
+  },
+  {
+    "object_id": 49,
+    "class_id": 2,
+    "confidence": 0.6943359375,
+    "marker_id": 1,
+    "first_seen": 1742718599.1823833,
+    "last_seen": 1742718599.1823833,
+    "duration": null,
+    "event": "no_entry",
+    "bbox": [
+      0.3863535245259603,
+      0.5027136484781901,
+      0.2941610336303711,
+      0.2790083991156684
+    ],
+    "id_rule_applied": 1,
+    "plate_text": null,
+    "province": null
+  }
+]
