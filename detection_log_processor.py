@@ -4,14 +4,14 @@ import logging
 import time
 import cv2
 import uuid
+import numpy as np
 import paho.mqtt.client as mqtt
 from paho.mqtt import client as mqtt_client
 import threading
 from datetime import datetime
 from rtsp_frame_reader import RTSPFrameReader
-from PIL import Image  # Added to support snapshot conversion
+from PIL import Image
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -21,21 +21,18 @@ logging.basicConfig(
 class DetectionLogProcessor:
     """
     Processes detection logs received via MQTT.
-    When an event is received (for events like no_entry, no_parking, wrong_way),
-    it retrieves the latest frame from a persistent RTSP stream connection.
-    After processing the event (drawing bounding box and saving the frame),
-    it optionally sends a snapshot (as a PIL image) via a callback.
+    When a detection event is received, it retrieves the latest RTSP frame,
+    draws the bounding box, saves the frame, and then calls a snapshot callback
+    with a cropped region for further processing.
     """
     def __init__(self, config_path: str, snapshot_callback=None):
         with open(config_path, 'r') as f:
             self.config = json.load(f)
 
-        # For properties, we still use the local video file (if needed)
         self.output_dir = self.config.get('output_dir', 'event_images')
         os.makedirs(self.output_dir, exist_ok=True)
         self.snapshot_callback = snapshot_callback
 
-        # Initialize MQTT client
         self.client_id = f"client-{uuid.uuid4()}"
         self.client = mqtt_client.Client(client_id=self.client_id, protocol=mqtt_client.MQTTv311)
         self.client.username_pw_set(self.config.get('mqtt_username'), self.config.get('mqtt_password'))
@@ -49,11 +46,11 @@ class DetectionLogProcessor:
         self.incident_topic = f"{self.config.get('detection_topic')}/{self.unique_id}"
         logging.info("Detection Log Processor initialized")
 
-        # Start a persistent RTSP connection using the provided RTSP URL.
         rtsp_url = self.config.get('rtsp_url')
         if not rtsp_url:
             logging.error("RTSP URL is not provided in configuration.")
             raise ValueError("RTSP URL missing")
+        # You can set use_gstreamer=True for lower latency and to avoid buffer warnings.
         self.rtsp_reader = RTSPFrameReader(rtsp_url)
         self.rtsp_reader.start()
 
@@ -85,11 +82,16 @@ class DetectionLogProcessor:
         self.process_detection_event(payload)
 
     def process_detection_event(self, event):
-        frame = self.rtsp_reader.get_frame()
-        if frame is None:
-            logging.error("No frame available from RTSP stream at this moment.")
+        frame = self.rtsp_reader.get_frame()  # Now returns just the frame
+        if frame is None or not isinstance(frame, np.ndarray):
+            logging.error("No valid frame available from RTSP stream at this moment.")
             return
 
+        # Verify frame is a valid numpy array with shape
+        if not hasattr(frame, 'shape') or len(frame.shape) < 2:
+            logging.error(f"Invalid frame format: {type(frame)}")
+            return
+            
         event_type = event.get('event', 'unknown')
         object_id = event.get('object_id', 'unknown')
         event_time = event.get('first_seen') or time.time()
@@ -120,25 +122,52 @@ class DetectionLogProcessor:
                 y1 = max(0, y1)
                 x2 = min(frame_width - 1, x2)
                 y2 = min(frame_height - 1, y2)
+                
+                # Check that bounding box dimensions are valid
+                if x2 <= x1 or y2 <= y1:
+                    logging.error(f"Invalid bounding box: x1={x1}, x2={x2}, y1={y1}, y2={y2}. Using full frame.")
+                    cropped = frame.copy()  # Use a copy of the full frame
+                else:
+                    cropped = frame[y1:y2, x1:x2].copy()  # Make a copy of the slice
+                    
+                # Add the bounding box to the frame
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
                 label = f"{event_type.upper()}: Object {object_id}"
                 cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                cropped = frame[y1:y2, x1:x2]
             except Exception as e:
-                logging.error(f"Error drawing bounding box: {e}")
+                logging.error(f"Error drawing bounding box: {e}", exc_info=True)
+                # If we failed to process the bounding box, use a copy of the full frame
+                cropped = frame.copy()
 
-        if cv2.imwrite(output_path, frame):
-            logging.info(f"Saved event frame to {output_path}")
-        else:
-            logging.error("Failed to write event frame image.")
+        # Save the frame (with bounding box if available)
+        try:
+            if cv2.imwrite(output_path, frame):
+                logging.info(f"Saved event frame to {output_path}")
+            else:
+                logging.error("Failed to write event frame image.")
+        except Exception as e:
+            logging.error(f"Exception saving event frame: {e}", exc_info=True)
 
-        # Call snapshot callback with both the image and event
+        # Prepare the cropped image for snapshot callback
         if self.snapshot_callback is not None:
             if cropped is None:
-                cropped = frame
-            cropped_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(cropped_rgb)
-            self.snapshot_callback(pil_image, event)
+                cropped = frame.copy()  # Use a copy of the full frame
+                
+            # Ensure cropped is a valid numpy array
+            if not isinstance(cropped, np.ndarray):
+                logging.error(f"Invalid cropped image type: {type(cropped)}")
+                return
+                
+            if not hasattr(cropped, "shape") or cropped.size == 0:
+                logging.error("Cropped image is empty or has an invalid shape.")
+                return
+
+            try:
+                cropped_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(cropped_rgb)
+                self.snapshot_callback(pil_image, event)
+            except Exception as e:
+                logging.error(f"Error preparing cropped image for callback: {e}", exc_info=True)
 
     def run(self):
         try:
@@ -151,8 +180,3 @@ class DetectionLogProcessor:
         finally:
             self.client.disconnect()
             self.rtsp_reader.stop()
-
-if __name__ == "__main__":
-    config_path = "config.json"
-    processor = DetectionLogProcessor(config_path)
-    processor.run()
