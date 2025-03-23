@@ -46,8 +46,9 @@ class RTSPFrameReader(threading.Thread):
             self.cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
         else:
             # FFMPEG with optimized parameters
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;udp|buffer_size;1024|max_delay;0|reorder_queue_size;0"
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|buffer_size;1024|max_delay;0|reorder_queue_size;0"
             self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+            # self.cap = cv2.VideoCapture(self.rtsp_url)
             
             # Minimal buffering settings
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)

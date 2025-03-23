@@ -1,14 +1,14 @@
 {
     "buffer_size": 2,
-    "unique_id": "Test",
+    "unique_id": "Testkaii",
     "rtsp_url": "rtsp://161.246.5.10:9999/samui_front",
     "mqtt_broker": "f8b13f71.ala.asia-southeast1.emqxsl.com",
     "mqtt_port": 8883,
     "mqtt_username": "PP",
     "mqtt_password": "pppppppp",
-    "ca_cert_path": "C:/Users/anawi/Downloads/RTSP_Server/cert/emqxsl-ca.crt",
-    "detection_topic": "detection",
-    "output_dir": "E:/Work/PP/CE fighting/Y4/T1/DetectionLogProcessor/output",
+    "ca_cert_path": "cert/emqxsl-ca.crt",
+    "detection_topic": "detection_log",
+    "output_dir": "output",
     "plate_detector_model_path": "./weight/yolov10b_ft_local_v2.pt",
     "ocr_plate_model_path": "./weight/yolov10b_ft_ocr_v2.pt"
 }

@@ -277,8 +277,8 @@ class PlateProcessingPipeline:
                             # Save result
                             with file_lock:
                                 processed_results.append(result)
-                                with open(os.path.join(config["output_dir"], "plates_results.json"), "w") as f:
-                                    json.dump(processed_results, f, indent=2)
+                                with open(os.path.join(config["output_dir"], "plates_results.json"), "w",encoding="utf-8") as f:
+                                    json.dump(processed_results, f,ensure_ascii=False, indent=2)
                     else:
                         logging.info("No license plate detected")
                 
