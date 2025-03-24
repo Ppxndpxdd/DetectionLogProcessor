@@ -14,7 +14,7 @@ import psutil
 from detection_log_processor import DetectionLogProcessor
 from plate_detector import PlateDetector
 from ocr_plate import OCRPlate
-from frame_buffer import FrameBuffer
+from frame_buffer import TimeSyncedFrameBuffer
 
 # Configure logging with microsecond precision for timing analysis
 logging.basicConfig(
@@ -45,7 +45,7 @@ metrics_lock = threading.RLock()
 shutdown_event = threading.Event()
 
 # Create the shared frame buffer between pipelines
-frame_buffer = FrameBuffer(max_size=config.get("buffer_size", 30))
+frame_buffer = TimeSyncedFrameBuffer(max_size=config.get("buffer_size", 30))
 
 # Global reference to components
 rtsp_reader = None
@@ -107,192 +107,60 @@ def log_metrics():
             logging.info(f"Processing Pipeline: Avg={avg_processing*1000:.1f}ms, "
                          f"Min={min_processing*1000:.1f}ms, Max={max_processing*1000:.1f}ms")
 
-# Pipeline 1: Frame Acquisition
-class FrameAcquisitionPipeline:
+def mqtt_callback(original_snapshot, event):
     """
-    Pipeline 1: Ultra-low latency frame capture from RTSP with optimized event handling
+    High-performance callback for MQTT events
+    Uses burst capture and precise frame sync
     """
-    def __init__(self, rtsp_url):
-        global rtsp_reader
-        
-        # Initialize RTSP reader
-        from rtsp_frame_reader import RTSPFrameReader
-        rtsp_reader = RTSPFrameReader(rtsp_url)
-        rtsp_reader.start()
-        
-        # Start frame capture thread with high priority
-        self.capture_thread = threading.Thread(
-            target=self._frame_capture_thread, 
-            daemon=True,
-            name="Frame-Capture"
-        )
-        self.capture_thread.start()
-        
-    def _frame_capture_thread(self):
-        """Continuously captures frames with high priority"""
-        logging.info("Frame capture thread started")
-        set_high_priority()  # Make this thread high priority
-        
-        last_frame_time = 0
-        
-        while not shutdown_event.is_set():
-            try:
-                # Get the best quality frame with timestamp
-                frame, timestamp = rtsp_reader.get_best_frame()
-                
-                if frame is not None and isinstance(frame, np.ndarray):
-                    if timestamp > last_frame_time:
-                        # Add to recent frames buffer
-                        frame_buffer.add_recent_frame(frame, timestamp)
-                        last_frame_time = timestamp
-                
-                # Adaptive sleep to match frame rate
-                time.sleep(0.001)  # Minimal sleep to prevent CPU overload
-                
-            except Exception as e:
-                logging.error(f"Error in frame capture thread: {e}", exc_info=True)
-                time.sleep(0.1)
+    start_time = time.time()
     
-    def handle_mqtt_event(self, event: Dict[str, Any], original_snapshot=None):
-        """
-        High-performance event handler that finds the optimal frame for each detection event
-        """
-        start_time = time.time()
+    try:
+        # Record receipt time
+        event_time = event.get('first_seen')
+        receipt_time = event.get('_received_time', time.time())
         
-        try:
-            # Extract event info with robust error handling
-            event_time = event.get('first_seen')
-            if isinstance(event_time, str):
-                try:
-                    event_time = float(event_time)
-                except ValueError:
-                    event_time = time.time()
-            elif event_time is None:
-                event_time = time.time()
-            
-            # Find the best matching frame from advanced buffer
-            best_frame, frame_timestamp = frame_buffer.get_best_frame_for_event(event)
-            
-            # If no good frame found, use the provided snapshot or get current frame
-            if best_frame is None:
-                if original_snapshot is not None and isinstance(original_snapshot, Image.Image):
-                    # Convert PIL Image to OpenCV format
-                    best_frame = np.array(original_snapshot.convert('RGB'))
-                    best_frame = cv2.cvtColor(best_frame, cv2.COLOR_RGB2BGR)
-                    frame_timestamp = time.time()
-                else:
-                    # Get best available frame as fallback
-                    best_frame, frame_timestamp = rtsp_reader.get_best_frame()
-                    
-                    if best_frame is None:
-                        # Last resort: get current frame
-                        best_frame = rtsp_reader.get_frame()
-                        frame_timestamp = time.time()
-                    
-                if best_frame is None:
-                    logging.error("Failed to get a valid frame for event")
-                    return
-                    
-            # Check frame age - we want fresh frames
-            frame_age = time.time() - frame_timestamp
-            if frame_age > 1.0:  # Over 1 second old
-                logging.warning(f"Using older frame ({frame_age:.2f}s old) for processing")
-            
-            # Draw bounding box on frame for visualization and save it
-            display_frame = best_frame.copy()
-            bbox = event.get('bbox')
-            cropped_frame = None
-            
-            if bbox and len(bbox) == 4:
-                try:
-                    x_center_norm, y_center_norm, width_norm, height_norm = bbox
-                    frame_height, frame_width = display_frame.shape[:2]
-                    
-                    # Convert normalized coordinates to pixel coordinates
-                    x_center = x_center_norm * frame_width
-                    y_center = y_center_norm * frame_height
-                    width = width_norm * frame_width
-                    height = height_norm * frame_height
-                    
-                    # Calculate bounding box coordinates
-                    x1 = max(0, int(x_center - width / 2))
-                    y1 = max(0, int(y_center - height / 2))
-                    x2 = min(frame_width - 1, int(x_center + width / 2))
-                    y2 = min(frame_height - 1, int(y_center + height / 2))
-                    
-                    # Check that bounding box dimensions are valid
-                    if x2 > x1 and y2 > y1:
-                        # Draw bounding box on display frame
-                        cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                        
-                        event_type = event.get('event', 'unknown')
-                        object_id = event.get('object_id', 'unknown')
-                        label = f"{event_type.upper()}: Object {object_id}"
-                        cv2.putText(display_frame, label, (x1, y1 - 10), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                        
-                        # Add frame age to the display
-                        cv2.putText(display_frame, 
-                                   f"Frame age: {frame_age*1000:.0f}ms", 
-                                   (10, 30), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        
-                        # Crop the region of interest with margins for better plate detection
-                        # Add 10% margin to each side of bounding box for better context
-                        margin_x = int(width * 0.1)
-                        margin_y = int(height * 0.1)
-                        crop_x1 = max(0, x1 - margin_x)
-                        crop_y1 = max(0, y1 - margin_y)
-                        crop_x2 = min(frame_width - 1, x2 + margin_x)
-                        crop_y2 = min(frame_height - 1, y2 + margin_y)
-                        
-                        cropped_frame = best_frame[crop_y1:crop_y2, crop_x1:crop_x2].copy()
-                    else:
-                        logging.warning(f"Invalid bounding box: ({x1},{y1}), ({x2},{y2})")
-                        cropped_frame = best_frame.copy()
-                except Exception as e:
-                    logging.error(f"Error processing bounding box: {e}", exc_info=True)
-                    cropped_frame = best_frame.copy()
-            else:
-                cropped_frame = best_frame.copy()
-            
-            # Save the visualization frame
+        if isinstance(event_time, str):
             try:
-                event_type = event.get('event', 'unknown')
-                object_id = event.get('object_id', 'unknown')
-                timestamp_str = time.strftime("%Y%m%d_%H%M%S")
-                output_path = os.path.join(config["output_dir"], 
-                                          f"{event_type}_obj{object_id}_{timestamp_str}.jpg")
-                cv2.imwrite(output_path, display_frame)
-                logging.info(f"Saved event frame to {output_path} (age: {frame_age*1000:.0f}ms)")
-            except Exception as e:
-                logging.error(f"Error saving event frame: {e}", exc_info=True)
+                event_time = float(event_time)
+            except ValueError:
+                event_time = receipt_time
+        elif event_time is None:
+            event_time = receipt_time
             
-            # Put the cropped frame in the processing buffer with high priority
-            if cropped_frame is not None:
-                frame_buffer.put(cropped_frame, event, frame_timestamp)
-                logging.info(f"Queued frame for processing: obj={event.get('object_id', 'unknown')}")
-            
-            # Record performance metrics
-            process_time = time.time() - start_time
-            update_metrics(acquisition_times, process_time)
-            if process_time > 0.05:  # More than 50ms is slow for acquisition
-                logging.warning(f"Slow event processing in acquisition: {process_time*1000:.1f}ms")
+        # Store event in logs
+        detection_log_list.append(event.copy())
+        
+        # Process the cropped image for plate detection
+        if original_snapshot is not None:
+            # Convert to OpenCV format if needed
+            if isinstance(original_snapshot, Image.Image):
+                frame = np.array(original_snapshot.convert('RGB'))
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            else:
+                frame = original_snapshot
                 
-        except Exception as e:
-            logging.error(f"Error in handle_mqtt_event: {e}", exc_info=True)
+            # Queue for processing
+            frame_buffer.put(frame, event, receipt_time)
+            logging.info(f"Queued frame for processing: obj={event.get('object_id', 'unknown')}")
+            
+        # Record performance
+        process_time = time.time() - start_time
+        update_metrics(acquisition_times, process_time)
+        
+    except Exception as e:
+        logging.error(f"Error in MQTT callback: {e}", exc_info=True)
 
-# Pipeline 2: Plate Detection and OCR with multi-threading
+# Pipeline for plate processing
 class PlateProcessingPipeline:
     """
-    Pipeline 2: Multi-threaded plate detection and OCR for high throughput
+    Optimized plate detection and OCR pipeline
     """
     def __init__(self, plate_model_path, ocr_model_path, num_workers=1):
-        # Initialize models (shared across threads)
+        # Initialize models
         self.plate_detector = PlateDetector(plate_model_path)
         self.ocr_plate = OCRPlate(ocr_model_path)
         
-        # Start processing workers
+        # Start worker threads
         self.num_workers = num_workers
         self.worker_threads = []
         
@@ -322,24 +190,18 @@ class PlateProcessingPipeline:
                 start_time = time.time()
                 frame_age = time.time() - packet.timestamp
                 
-                # Skip if frame is too old (more than 2 seconds)
+                # Skip if frame is too old
                 if frame_age > 2.0:
                     logging.warning(f"Skipping old frame in processing: {frame_age:.2f}s old")
                     frame_buffer.task_done()
                     continue
                 
-                # Convert to PIL Image for plate detector
+                # Process the frame
                 try:
-                    # First check if the frame is valid
-                    if packet.frame is None or not isinstance(packet.frame, np.ndarray):
-                        logging.error("Invalid frame in packet")
-                        frame_buffer.task_done()
-                        continue
-                        
-                    # Convert to RGB for PIL
+                    # Convert to PIL Image
                     pil_image = Image.fromarray(cv2.cvtColor(packet.frame, cv2.COLOR_BGR2RGB))
                     
-                    # Detect license plate with timing
+                    # Detect license plate
                     plate_start = time.time()
                     plate_region = self.plate_detector.detect_plate(pil_image)
                     plate_time = time.time() - plate_start
@@ -373,53 +235,37 @@ class PlateProcessingPipeline:
                                 "frame_age": frame_age,
                                 "processing_time": time.time() - start_time,
                                 "detection_time": plate_time,
-                                "ocr_time": ocr_time
+                                "ocr_time": ocr_time,
+                                "event_to_detection_latency": time.time() - packet.timestamp
                             }
                             
-                            # Save result atomically
+                            # Save result
                             with file_lock:
                                 processed_results.append(result)
-                                with open(os.path.join(config["output_dir"], "plates_results.json"), "w",encoding="utf-8") as f:
-                                    json.dump(processed_results, f,ensure_ascii=False, indent=2)
+                                with open(os.path.join(config["output_dir"], "plates_results.json"), "w", encoding="utf-8") as f:
+                                    json.dump(processed_results, f, ensure_ascii=False, indent=2)
                     else:
                         logging.info("No license plate detected")
                 
                 except Exception as e:
-                    logging.error(f"Error processing frame: {e}", exc_info=True)
+                    logging.error(f"Error processing plate: {e}", exc_info=True)
                     consecutive_errors += 1
                 finally:
                     # Mark task as done
                     frame_buffer.task_done()
                     
-                    # Record performance metrics
+                    # Record metrics
                     process_time = time.time() - start_time
                     update_metrics(processing_times, process_time)
-                    if process_time > 0.5:
-                        logging.warning(f"Slow processing in plate pipeline: {process_time*1000:.1f}ms")
                     
-                    # Reset error counter if successful
-                    if consecutive_errors > 0:
-                        consecutive_errors -= 1
-            
+                    # Reset error counter on success
+                    consecutive_errors = max(0, consecutive_errors - 1)
+                    
             except Exception as e:
-                logging.error(f"Error in processing thread: {e}", exc_info=True)
+                logging.error(f"Error in processing worker: {e}", exc_info=True)
                 consecutive_errors += 1
                 if consecutive_errors > 5:
-                    # Back off if persistent errors
-                    time.sleep(1)
-
-def mqtt_callback(original_snapshot, event):
-    """
-    Optimized callback function for DetectionLogProcessor
-    Forwards events to the acquisition pipeline
-    """
-    global acquisition_pipeline
-    
-    # Add event timestamp for tracking latency
-    event['_received_time'] = time.time()
-    
-    # Pass to acquisition pipeline
-    acquisition_pipeline.handle_mqtt_event(event, original_snapshot)
+                    time.sleep(1)  # Back off on persistent errors
 
 def metrics_reporter():
     """Thread that periodically logs performance metrics"""
@@ -437,80 +283,36 @@ def metrics_reporter():
         except Exception:
             pass
             
-        # Report maximum latency
+        # Report latency metrics
         try:
             if processed_results:
                 recent_results = processed_results[-10:]
-                times = [r.get('frame_age', 0) for r in recent_results]
-                if times:
-                    avg_age = sum(times) / len(times)
-                    logging.info(f"Average frame age at processing: {avg_age*1000:.1f}ms")
-        except Exception:
-            pass
+                e2e_latencies = [r.get('event_to_detection_latency', 0) for r in recent_results if 'event_to_detection_latency' in r]
+                if e2e_latencies:
+                    avg_latency = sum(e2e_latencies) / len(e2e_latencies)
+                    max_latency = max(e2e_latencies)
+                    logging.info(f"End-to-end latency: Avg={avg_latency*1000:.1f}ms, Max={max_latency*1000:.1f}ms")
+        except Exception as e:
+            logging.error(f"Error reporting metrics: {e}")
             
         time.sleep(30)  # Report every 30 seconds
 
-def adaptive_performance_tuner():
-    """
-    Thread that monitors system performance and dynamically adjusts parameters
-    to maintain optimal performance
-    """
-    global frame_buffer
-    
-    logging.info("Starting adaptive performance tuning")
-    
-    while not shutdown_event.is_set():
-        try:
-            # Check system resources
-            cpu_percent = psutil.cpu_percent(interval=1)
-            
-            # Adjust parameters based on CPU usage
-            if cpu_percent > 90:  # High CPU load
-                # Make frame selection more aggressive to reduce workload
-                logging.info(f"High CPU load ({cpu_percent}%), adjusting parameters")
-                # Future logic to adjust parameters
-                
-            elif cpu_percent < 50:  # Low CPU load
-                # Allow more processing to improve quality
-                pass
-                
-            # Check processing times
-            with metrics_lock:
-                if processing_times and len(processing_times) > 10:
-                    avg_time = sum(processing_times[-10:]) / 10
-                    if avg_time > 0.5:  # Processing taking > 500ms
-                        logging.info(f"Slow processing detected ({avg_time*1000:.1f}ms), adjusting parameters")
-                        # Future logic to adjust parameters
-            
-            time.sleep(5)  # Check every 5 seconds
-            
-        except Exception as e:
-            logging.error(f"Error in adaptive tuner: {e}")
-            time.sleep(10)
-
 def main():
-    """Main entry point with improved thread management and error handling"""
-    global acquisition_pipeline, processing_pipeline, detection_processor
+    """Main entry point"""
+    global detection_processor, processing_pipeline
     
     try:
         # Set main process to high priority
         set_high_priority()
         
-        logging.info("Starting License Plate Recognition System...")
+        logging.info("Starting Enhanced License Plate Recognition System...")
         
-        # Initialize Pipeline 1: Frame acquisition
-        logging.info("Initializing frame acquisition pipeline")
-        rtsp_url = config.get('rtsp_url')
-        if not rtsp_url:
-            raise ValueError("RTSP URL missing from config")
-        acquisition_pipeline = FrameAcquisitionPipeline(rtsp_url)
-        
-        # Initialize Pipeline 2: Plate processing
+        # Initialize plate processing pipeline
         logging.info("Initializing plate processing pipeline")
         plate_model_path = config.get('plate_detector_model_path')
         ocr_model_path = config.get('ocr_plate_model_path')
         
-        # Determine optimal number of worker threads based on CPU cores
+        # Determine optimal number of worker threads
         worker_threads = max(1, min(2, psutil.cpu_count(logical=False) - 1))
         logging.info(f"Using {worker_threads} worker threads for processing")
         
@@ -528,16 +330,8 @@ def main():
         )
         metrics_thread.start()
         
-        # Start adaptive performance tuner
-        tuner_thread = threading.Thread(
-            target=adaptive_performance_tuner,
-            daemon=True,
-            name="Performance-Tuner"
-        )
-        tuner_thread.start()
-        
-        # Initialize and start detection processor
-        logging.info("Initializing MQTT detection processor")
+        # Initialize detection processor with advanced frame synchronization
+        logging.info("Initializing detection processor with real-time frame synchronization")
         detection_processor = DetectionLogProcessor("config.json", mqtt_callback)
         
         # Main loop

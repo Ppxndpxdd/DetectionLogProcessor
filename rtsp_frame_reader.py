@@ -10,8 +10,7 @@ import platform
 
 class RTSPFrameReader(threading.Thread):
     """
-    High-performance RTSP frame reader with hardware acceleration 
-    and adaptive frame management for real-time video processing.
+    High-performance RTSP frame reader with burst capture for critical events
     """
     def __init__(self, rtsp_url, use_gstreamer=None, max_queue_size=1):
         super().__init__(daemon=True)
@@ -27,6 +26,14 @@ class RTSPFrameReader(threading.Thread):
         
         # Enhanced frame buffer with adaptive timing
         self.frame_deque = deque(maxlen=30)  # Store more frames for better matching
+        
+        # Critical event handling - separate high-priority buffer for events
+        self.event_frames = deque(maxlen=15)  # Special buffer for event frames
+        self.burst_mode = False  # Flag for burst mode during events
+        self.burst_until = 0  # Time when burst mode should end
+        self.burst_frame_count = 0  # Number of frames captured in burst mode
+        
+        # Performance tracking
         self.last_frame_time = 0
         self.frame_count = 0
         self.processed_count = 0
@@ -39,8 +46,8 @@ class RTSPFrameReader(threading.Thread):
         self.motion_score = 0
         
         # Adaptive parameters
-        self.quality_threshold = 0.5  # Dynamic quality threshold
-        self.skip_frames_count = 3    # Dynamic frame skip count
+        self.quality_threshold = 0.4  # Lower threshold for faster response
+        self.skip_frames_count = 1    # Minimize frame skipping for events
         
         # Connection parameters
         self.reconnect_interval = 3
@@ -56,6 +63,7 @@ class RTSPFrameReader(threading.Thread):
         self.latest_frame = None
         self.latest_frame_time = 0
         self.lock = threading.RLock()
+        self.event_lock = threading.RLock()  # Separate lock for event frames
         self.stopped = False
         
         # Frame prediction
@@ -92,58 +100,87 @@ class RTSPFrameReader(threading.Thread):
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 0)
             
             # Try hardware acceleration if available
-            if cv2.cuda.getCudaEnabledDeviceCount() > 0:
-                logging.info("CUDA hardware acceleration available")
-                # CUDA settings would go here
+            try:
+                if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                    logging.info("CUDA hardware acceleration available")
+            except:
+                pass
             
             logging.info("Using FFMPEG backend for RTSP")
         
         if self.cap.isOpened():
             logging.info(f"RTSP stream opened: {self.rtsp_url}")
             
-            # Adjust capture parameters
+            # Adjust capture parameters for minimal latency
             width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fps = self.cap.get(cv2.CAP_PROP_FPS)
             logging.info(f"Stream properties: {width}x{height} @ {fps}fps")
+            
+            # Set timeouts for faster frame capture
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         else:
             logging.error(f"Failed to open RTSP stream: {self.rtsp_url}")
 
     def _calculate_frame_quality(self, frame):
-        """Calculate frame quality metrics for adaptive processing"""
+        """Fast calculation of frame quality metrics"""
         if frame is None:
             return 0
             
         try:
-            # Fast quality assessment using downsampled grayscale
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            small = cv2.resize(gray, (0, 0), fx=0.25, fy=0.25)
+            # Faster quality assessment - only process a center crop
+            height, width = frame.shape[:2]
+            center_x, center_y = width // 2, height // 2
+            crop_size = min(width, height) // 4
             
-            # Sharpness - Laplacian variance
-            laplacian = cv2.Laplacian(small, cv2.CV_64F)
+            # Extract center region for analysis
+            center_crop = frame[
+                max(0, center_y - crop_size):min(height, center_y + crop_size),
+                max(0, center_x - crop_size):min(width, center_x + crop_size)
+            ]
+            
+            # Calculate using grayscale to save time
+            gray = cv2.cvtColor(center_crop, cv2.COLOR_BGR2GRAY)
+            
+            # Fast sharpness calculation
+            laplacian = cv2.Laplacian(gray, cv2.CV_64F)
             self.frame_sharpness = laplacian.var()
             
-            # Brightness
-            self.frame_brightness = np.mean(small)
+            # Fast brightness calculation
+            self.frame_brightness = np.mean(gray)
             
-            # Motion detection if we have previous frame
-            if self.prev_frame is not None:
-                diff = cv2.absdiff(small, self.prev_frame)
+            # Fast motion detection if we have previous frame
+            if self.prev_frame is not None and self.prev_frame.shape == gray.shape:
+                diff = cv2.absdiff(gray, self.prev_frame)
                 self.motion_score = np.mean(diff)
+            else:
+                self.motion_score = 0
                 
-            self.prev_frame = small
+            self.prev_frame = gray.copy()
                 
             # Combined quality score (0-1)
-            if self.frame_sharpness > 500:  # Empirical threshold
-                quality = min(1.0, self.frame_sharpness / 2000.0) * 0.7 + self.motion_score * 0.3
+            if self.frame_sharpness > 100:  # Lower threshold for faster response
+                quality = min(1.0, self.frame_sharpness / 1000.0) * 0.6 + self.motion_score * 0.4
             else:
-                quality = 0.3 + self.motion_score * 0.7
+                quality = 0.2 + self.motion_score * 0.8
                 
             return quality
             
         except Exception as e:
             logging.error(f"Error calculating frame quality: {e}")
             return 0.5  # Default quality
+
+    def trigger_burst_mode(self, duration=0.25):
+        """
+        Trigger burst mode to capture frames at maximum rate for a short duration
+        This is called when an MQTT event arrives
+        """
+        with self.event_lock:
+            self.burst_mode = True
+            self.burst_until = time.time() + duration
+            self.burst_frame_count = 0
+            self.event_frames.clear()  # Clear previous event frames
+        logging.debug(f"Burst mode triggered for {duration}s")
 
     def run(self):
         """Main acquisition thread - continuously captures frames with adaptive timing"""
@@ -154,8 +191,24 @@ class RTSPFrameReader(threading.Thread):
         
         while not self.stopped:
             try:
-                # Adaptive frame skipping based on system performance
-                for _ in range(max(1, self.skip_frames_count)):
+                # Check if we should be in burst mode
+                in_burst_mode = False
+                with self.event_lock:
+                    if self.burst_mode and time.time() <= self.burst_until:
+                        in_burst_mode = True
+                    elif self.burst_mode:
+                        self.burst_mode = False
+                        logging.debug(f"Burst mode ended, captured {self.burst_frame_count} frames")
+                
+                # In burst mode, capture every frame with no skipping
+                if in_burst_mode:
+                    skip_count = 0
+                else:
+                    # Regular mode - use adaptive skip count
+                    skip_count = max(0, self.skip_frames_count - 1)
+                
+                # Skip frames if needed
+                for _ in range(skip_count):
                     self.cap.grab()
                 
                 # Read the frame
@@ -172,33 +225,30 @@ class RTSPFrameReader(threading.Thread):
                         interval = current_time - last_frame_time
                         self.frame_interval_history.append(interval)
                     
-                    # Calculate quality and decide whether to use this frame
+                    # Calculate quality 
                     frame_quality = self._calculate_frame_quality(frame)
                     
-                    # Keep high-quality frames, or if we haven't had a good one in a while
-                    if frame_quality >= self.quality_threshold or consecutive_empty_frames >= 10:
+                    # For burst mode, capture every frame regardless of quality
+                    if in_burst_mode:
+                        with self.event_lock:
+                            self.event_frames.append((frame.copy(), current_time, frame_quality))
+                            self.burst_frame_count += 1
+                            
+                            # Also update latest frame reference
+                            self.latest_frame = frame.copy()
+                            self.latest_frame_time = current_time
+                    
+                    # For regular mode, filter by quality
+                    elif frame_quality >= self.quality_threshold or consecutive_empty_frames >= 5:
                         # Store frame with timestamp and quality info
                         with self.lock:
-                            self.latest_frame = frame
+                            self.latest_frame = frame.copy()
                             self.latest_frame_time = current_time
                             self.frame_deque.append((frame.copy(), current_time, frame_quality))
                         consecutive_empty_frames = 0
                     else:
                         self.skipped_count += 1
                         consecutive_empty_frames += 1
-                    
-                    # Update adaptive parameters based on system performance
-                    if len(self.frame_interval_history) >= 30:
-                        mean_interval = np.mean(self.frame_interval_history)
-                        
-                        # If we're processing frames quickly, be more selective
-                        if mean_interval < 0.02:  # < 20ms between frames
-                            self.quality_threshold = min(0.7, self.quality_threshold + 0.02)
-                            self.skip_frames_count = min(5, self.skip_frames_count + 1)
-                        # If we're processing slowly, be less selective
-                        elif mean_interval > 0.05:  # > 50ms between frames
-                            self.quality_threshold = max(0.3, self.quality_threshold - 0.02)
-                            self.skip_frames_count = max(1, self.skip_frames_count - 1)
                     
                     # Log performance metrics every 5 seconds
                     if current_time - last_log_time > 5:
@@ -207,10 +257,8 @@ class RTSPFrameReader(threading.Thread):
                             fps = frames_since_log / elapsed
                             self.fps = fps
                             logging.debug(f"RTSP: {fps:.1f}fps, Quality: {frame_quality:.2f}, "
-                                          f"Threshold: {self.quality_threshold:.2f}, "
-                                          f"Skip: {self.skip_frames_count}, "
-                                          f"Total: {self.frame_count}, Process: {self.processed_count}, "
-                                          f"Skip: {self.skipped_count}, Buffer: {len(self.frame_deque)}")
+                                          f"Buffer: {len(self.frame_deque)}, "
+                                          f"Event Buffer: {len(self.event_frames)}")
                             frames_since_log = 0
                             last_log_time = current_time
                     
@@ -223,14 +271,18 @@ class RTSPFrameReader(threading.Thread):
                         self._reconnect()
                         consecutive_empty_frames = 0
                 
-                # Sleep adaptively based on frame rate
-                if len(self.frame_interval_history) > 0:
-                    expected_interval = np.median(self.frame_interval_history) * 0.5
-                    sleep_time = max(0.001, min(0.01, expected_interval))
+                # Sleep adaptively based on mode
+                if in_burst_mode:
+                    # Minimal sleep in burst mode
+                    time.sleep(0.001)
                 else:
-                    sleep_time = 0.001
-                    
-                time.sleep(sleep_time)
+                    # Normal mode - adaptive sleep
+                    if len(self.frame_interval_history) > 0:
+                        expected_interval = np.median(self.frame_interval_history) * 0.5
+                        sleep_time = max(0.001, min(0.01, expected_interval))
+                    else:
+                        sleep_time = 0.001
+                    time.sleep(sleep_time)
                 
             except Exception as e:
                 logging.error(f"Error in RTSP reader: {e}", exc_info=True)
@@ -261,6 +313,9 @@ class RTSPFrameReader(threading.Thread):
             with self.lock:
                 self.frame_deque.clear()
                 self.frame_interval_history.clear()
+                
+            with self.event_lock:
+                self.event_frames.clear()
         else:
             logging.error(f"Failed to reconnect on attempt {self.reconnect_attempts}")
 
@@ -275,6 +330,13 @@ class RTSPFrameReader(threading.Thread):
             self.processed_count += 1
             
             return best_frame.copy(), best_time
+            
+    def get_event_frames(self):
+        """Get all frames captured during burst mode"""
+        with self.event_lock:
+            if not self.event_frames:
+                return []
+            return [(frame.copy(), timestamp, quality) for frame, timestamp, quality in self.event_frames]
 
     def get_frame(self):
         """Get the most recent frame"""
@@ -291,32 +353,6 @@ class RTSPFrameReader(threading.Thread):
                 self.processed_count += 1
                 return self.latest_frame.copy(), self.latest_frame_time
             return None, 0
-    
-    def get_frame_closest_to_time(self, target_time, max_diff=0.5):
-        """Get the frame closest to the specified timestamp"""
-        with self.lock:
-            if not self.frame_deque:
-                return None, 0
-            
-            # Find frame with closest timestamp
-            closest_frame = None
-            closest_time = 0
-            min_diff = float('inf')
-            
-            for frame, timestamp, quality in self.frame_deque:
-                diff = abs(timestamp - target_time)
-                if diff < min_diff and diff <= max_diff:
-                    min_diff = diff
-                    closest_frame = frame
-                    closest_time = timestamp
-            
-            if closest_frame is not None:
-                self.processed_count += 1
-                return closest_frame.copy(), closest_time
-                
-            # Fall back to most recent frame if no close match
-            best_frame, best_time, _ = self.frame_deque[-1]
-            return best_frame.copy(), best_time
 
     def stop(self):
         """Stop the frame reader"""
