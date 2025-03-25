@@ -107,8 +107,22 @@ class DetectionLogProcessor:
             elif event_time is None:
                 event_time = receipt_time
                 
+            # Log the initial detection event
+            from main import detection_logs, detection_log_lock
+            with detection_log_lock:
+                initial_log = {
+                    "object_id": payload.get("object_id", "unknown"),
+                    "timestamp": receipt_time,
+                    "event_time": event_time,
+                    "event_type": payload.get("event", "unknown"),
+                    "detection_confidence": payload.get("confidence", 0),
+                    "mqtt_receipt_time": receipt_time,
+                    "event_phase": "initial_detection",
+                    "raw_payload": payload.copy()
+                }
+                detection_logs.append(initial_log)
+                
             # Calculate estimated network delay for better synchronization
-            # Typically MQTT events are received after the actual event
             network_delay = 0.05  # Assume 50ms network delay
             adjusted_event_time = event_time - network_delay
             

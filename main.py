@@ -56,6 +56,12 @@ detection_processor = None
 acquisition_pipeline = None
 processing_pipeline = None
 
+# Detection log storage
+detection_logs = []
+detection_log_lock = threading.RLock()
+detection_log_last_save_time = time.time()
+detection_log_save_interval = 30  # Seconds between saves
+
 # Set process and thread priorities
 def set_high_priority():
     """Set the current process to high priority"""
@@ -183,9 +189,24 @@ class PlateProcessingPipeline:
         logging.info(f"Plate processing pipeline initialized with {num_workers} workers and {ocr_threads} OCR threads")
     
     def _ocr_result_callback(self, plate_number, province, object_id, event_data):
-        """Handle OCR results from the dedicated OCR pool"""
+        """Handle OCR results from the dedicated OCR pool and save to detection logs"""
         if not plate_number or not province:
             logging.warning(f"OCR failed for object {object_id}")
+            
+            # Log failed OCR attempts too
+            with detection_log_lock:
+                detection_log = {
+                    "object_id": object_id,
+                    "timestamp": time.time(),
+                    "event_time": event_data.get('event_time'),
+                    "ocr_success": False,
+                    "event_type": event_data.get('original_event', {}).get('event', 'unknown'),
+                    "detection_confidence": event_data.get('confidence', 0),
+                    "processing_latency": time.time() - event_data.get('processing_start', time.time()),
+                    "ocr_status": "failed"
+                }
+                detection_logs.append(detection_log)
+            
             return
             
         # Process successful OCR result
@@ -225,10 +246,34 @@ class PlateProcessingPipeline:
                 if len(processed_results) % 5 == 0:
                     output_file = os.path.join(config["output_dir"], "results.json")
                     try:
-                        with open(output_file, "w") as f:
-                            json.dump(processed_results, f)
+                        with open(output_file, "w", encoding="utf-8") as f:
+                            json.dump(processed_results, f, ensure_ascii=False)
                     except Exception as e:
                         logging.error(f"Error saving results: {e}")
+            
+            # Add to detection logs with OCR output
+            with detection_log_lock:
+                detection_log = {
+                    "object_id": object_id,
+                    "timestamp": time.time(),
+                    "event_time": event_time,
+                    "ocr_success": True,
+                    "plate_number": plate_number,
+                    "province": province,
+                    "detection_confidence": event_data.get('confidence', 0),
+                    "processing_latency": total_time,
+                    "detection_time": detection_time,
+                    "ocr_time": ocr_time,
+                    "event_type": event_data.get('original_event', {}).get('event', 'unknown'),
+                    "ocr_status": "success",
+                    "frame_timestamp": event_data.get('timestamp'),
+                    "rtsp_frame_count": event_data.get('original_event', {}).get('frame_count', 0)
+                }
+                detection_logs.append(detection_log)
+                
+                # Check if we should save logs
+                if time.time() - detection_log_last_save_time > detection_log_save_interval:
+                    save_detection_logs()
             
             # Log results
             logging.info(f"Successfully processed: {plate_number} {province} | "
@@ -378,12 +423,19 @@ class PlateProcessingPipeline:
             except Exception as e:
                 logging.error(f"Error in OCR task: {e}", exc_info=True)
 
+# Update the metrics_reporter function
+
 def metrics_reporter():
-    """Thread that periodically logs performance metrics"""
+    """Thread that periodically logs performance metrics and saves detection logs"""
     while not shutdown_event.is_set():
         log_metrics()
         frame_buffer.log_stats()
         
+        # Save detection logs periodically
+        with detection_log_lock:
+            if detection_logs and time.time() - detection_log_last_save_time > detection_log_save_interval:
+                save_detection_logs()
+                
         # Report system resource usage
         try:
             process = psutil.Process()
@@ -430,6 +482,55 @@ def initialize_performance_monitor():
         
     logging.info("Performance monitoring system initialized")
     return performance_monitor
+
+# Function to save detection logs to JSON file
+def save_detection_logs():
+    """Save accumulated detection logs to JSON file"""
+    global detection_log_last_save_time
+    
+    with detection_log_lock:
+        if not detection_logs:
+            return
+            
+        try:
+            output_file = os.path.join(config["output_dir"], "detection_log.json")
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(detection_logs, f, ensure_ascii=False)
+            logging.info(f"Saved {len(detection_logs)} detection logs to {output_file}")
+            detection_log_last_save_time = time.time()
+        except Exception as e:
+            logging.error(f"Error saving detection logs: {e}")
+
+# Add this function after save_detection_logs()
+
+def analyze_ocr_performance():
+    """Analyze OCR performance statistics and log summary"""
+    with detection_log_lock:
+        if not detection_logs:
+            return
+            
+        total = len([log for log in detection_logs if log.get('event_phase') != 'initial_detection'])
+        successful = len([log for log in detection_logs if log.get('ocr_success', False)])
+        failed = total - successful
+        success_rate = (successful / total * 100) if total > 0 else 0
+        
+        # Calculate average OCR time
+        ocr_times = [log.get('ocr_time', 0) for log in detection_logs if 'ocr_time' in log]
+        avg_ocr_time = sum(ocr_times) / len(ocr_times) if ocr_times else 0
+        
+        logging.info(f"OCR Performance: {successful}/{total} successful ({success_rate:.1f}%), "
+                    f"Average OCR time: {avg_ocr_time*1000:.1f}ms")
+        
+        # Log the most common plate numbers
+        plate_counts = {}
+        for log in detection_logs:
+            if log.get('plate_number'):
+                plate = log.get('plate_number')
+                plate_counts[plate] = plate_counts.get(plate, 0) + 1
+                
+        if plate_counts:
+            top_plates = sorted(plate_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+            logging.info(f"Most common plates: {', '.join([f'{plate}({count})' for plate, count in top_plates])}")
 
 def main():
     """Main entry point"""
@@ -483,6 +584,11 @@ def main():
     finally:
         # Clean shutdown
         shutdown_event.set()
+        
+        # Save final detection logs before exiting
+        logging.info("Saving final detection logs...")
+        save_detection_logs()
+        
         if detection_processor:
             try:
                 detection_processor.client.disconnect()
