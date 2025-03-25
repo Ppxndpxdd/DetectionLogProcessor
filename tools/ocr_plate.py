@@ -15,10 +15,13 @@ class OCRPlate:
         # Device selection
         if torch.backends.mps.is_available():
             device = "mps"
-        # elif torch.cuda.is_available():
-        #     device = "cuda"
+            logging.info("mps device selected")
+        elif torch.cuda.is_available():
+            device = "cuda"
+            logging.info("cuda device selected")
         else:
             device = "cpu"
+            logging.warning("No GPU available, falling back to CPU")
         
         self.device = device
         self.class_id_map = {i: str(i) for i in range(10)}

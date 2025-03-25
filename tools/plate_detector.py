@@ -13,10 +13,13 @@ class PlateDetector:
         # Device selection
         if torch.backends.mps.is_available():
             device = "mps"
-        # elif torch.cuda.is_available():
-        #     device = "cuda"
+            logging.info("MPS enabled for plate detection")
+        elif torch.cuda.is_available():
+            device = "cuda"
+            logging.info("CUDA enabled for plate detection")
         else:
             device = "cpu"
+            logging.warning("No GPU available, using CPU for plate detection")
         
         # Allow overriding with CPU for stability
         self.device = device
