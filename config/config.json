@@ -9,6 +9,6 @@
     "ca_cert_path": "cert/emqxsl-ca.crt",
     "detection_topic": "detection_log",
     "output_dir": "output",
-    "plate_detector_model_path": "./weight/yolov10b_ft_local_v2.pt",
-    "ocr_plate_model_path": "./weight/yolov10b_ft_ocr_v2.pt"
+    "plate_detector_model_path": "./weight/yolov10b_ft_local_v2_openvino_model",
+    "ocr_plate_model_path": "./weight/yolov10b_ft_ocr_v2_openvino_model"
 }

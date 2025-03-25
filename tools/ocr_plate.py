@@ -237,7 +237,8 @@ class OCRPlate:
                 input_image, 
                 device=self.device, 
                 verbose=False,
-                conf=self.confidence_threshold
+                conf=self.confidence_threshold,
+                half=True
             )
             
             # Process results with safe tensor handling and character validation

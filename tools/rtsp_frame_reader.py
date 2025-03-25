@@ -12,7 +12,7 @@ class RTSPFrameReader(threading.Thread):
     """
     High-performance RTSP frame reader with burst capture for critical events
     """
-    def __init__(self, rtsp_url, use_gstreamer=None, max_queue_size=1):
+    def __init__(self, rtsp_url, use_gstreamer=False, max_queue_size=1):
         super().__init__(daemon=True)
         self.rtsp_url = rtsp_url
         

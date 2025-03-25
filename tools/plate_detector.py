@@ -128,7 +128,8 @@ class PlateDetector:
                         roi_image,
                         device=self.device,
                         verbose=False,
-                        conf=self.confidence_threshold
+                        conf=self.confidence_threshold,
+                        half=True
                     )
                     
                     if roi_result[0].boxes.xyxy.shape[0] > 0:
@@ -168,7 +169,8 @@ class PlateDetector:
                 image, 
                 device=self.device,
                 verbose=False,
-                conf=self.confidence_threshold
+                conf=self.confidence_threshold,
+                half=True
             )
             
             # Check if any plates detected
