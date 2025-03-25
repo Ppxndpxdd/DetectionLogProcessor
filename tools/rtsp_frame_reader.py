@@ -182,6 +182,31 @@ class RTSPFrameReader(threading.Thread):
             self.event_frames.clear()  # Clear previous event frames
         logging.debug(f"Burst mode triggered for {duration}s")
 
+    def trigger_precise_burst(self, event_time, duration=0.5, pre_event_time=0.2):
+        """
+        Enhanced burst mode that captures frames around a specific event time
+        
+        Args:
+            event_time: Timestamp of the event
+            duration: How long to continue burst after event_time (seconds)
+            pre_event_time: How much time before event to include (seconds)
+        """
+        with self.event_lock:
+            self.burst_mode = True
+            self.burst_start_time = event_time - pre_event_time
+            self.burst_until = event_time + duration
+            self.burst_frame_count = 0
+            self.burst_event_time = event_time
+            
+            # Don't clear existing event frames if this event is close to previous one
+            if len(self.event_frames) == 0 or abs(event_time - self.last_burst_event_time) > 1.0:
+                self.event_frames.clear()
+                
+            self.last_burst_event_time = event_time
+            
+        logging.debug(f"Precise burst mode triggered for event at {event_time}, "
+                     f"capturing frames from {self.burst_start_time} to {self.burst_until}")
+
     def run(self):
         """Main acquisition thread - continuously captures frames with adaptive timing"""
         last_frame_time = 0

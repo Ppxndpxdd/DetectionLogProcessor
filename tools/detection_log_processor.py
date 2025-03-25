@@ -10,7 +10,7 @@ from paho.mqtt import client as mqtt_client
 import threading
 from datetime import datetime
 import queue
-from rtsp_frame_reader import RTSPFrameReader
+from tools.rtsp_frame_reader import RTSPFrameReader
 from PIL import Image
 
 logging.basicConfig(
@@ -88,32 +88,121 @@ class DetectionLogProcessor:
             logging.error(f"Failed to connect to MQTT broker with code {rc}")
 
     def on_message(self, client, userdata, msg):
-        """Handle incoming MQTT messages with high priority"""
+        """Handle incoming MQTT messages with enhanced frame synchronization"""
         try:
-            # Trigger burst mode for high framerate capture
-            self.rtsp_reader.trigger_burst_mode(0.25)  # Capture at max framerate for 250ms
-            
             # Parse payload
             payload = json.loads(msg.payload.decode())
             
-            # Queue event for processing
-            if msg.topic.startswith(self.incident_topic):
-                # Add receipt timestamp
-                payload['_receipt_time'] = time.time()
-                self.event_queue.put(payload)
-                logging.info(f"Queued detection event: {payload.get('event')} for object {payload.get('object_id')}")
+            # Add receipt timestamp with high precision
+            receipt_time = time.time()
+            payload['_received_time'] = receipt_time
+            
+            # Extract event time with fallback mechanisms
+            event_time = payload.get('first_seen')
+            if isinstance(event_time, str):
+                try:
+                    event_time = float(event_time)
+                except ValueError:
+                    event_time = receipt_time
+            elif event_time is None:
+                event_time = receipt_time
+                
+            # Log the initial detection event
+            from main import detection_logs, detection_log_lock
+            with detection_log_lock:
+                initial_log = {
+                    "object_id": payload.get("object_id", "unknown"),
+                    "timestamp": receipt_time,
+                    "event_time": event_time,
+                    "event_type": payload.get("event", "unknown"),
+                    "detection_confidence": payload.get("confidence", 0),
+                    "mqtt_receipt_time": receipt_time,
+                    "event_phase": "initial_detection",
+                    "raw_payload": payload.copy()
+                }
+                detection_logs.append(initial_log)
+                
+            # Calculate estimated network delay for better synchronization
+            network_delay = 0.05  # Assume 50ms network delay
+            adjusted_event_time = event_time - network_delay
+            
+            # Trigger precise burst with extended pre-event time
+            self.rtsp_reader.trigger_precise_burst(
+                event_time=adjusted_event_time,
+                duration=0.3,       # Capture slightly longer after event
+                pre_event_time=0.2  # Capture more time before event
+            )
+            
+            # Calculate event priority for processing order
+            priority = self._calculate_event_priority(payload)
+            
+            # Apply backpressure if system is overloaded
+            if self.event_queue.qsize() > 15:
+                # Log detailed backlog information
+                logging.warning(f"Event queue backlog: {self.event_queue.qsize()} events, applying backpressure")
+                
+                # Skip low priority events when system is very busy
+                if self.event_queue.qsize() > 25 and priority < 7:
+                    logging.warning(f"Dropping low-priority event due to severe backlog")
+                    return
+                    
+            # Add processing metadata
+            payload['_priority'] = priority
+            payload['_adjusted_event_time'] = adjusted_event_time
+            
+            # Queue with priority and timestamps
+            self.event_queue.put((priority, receipt_time, payload))
+            
+            if priority >= 8:  # High priority event
+                logging.info(f"Queued HIGH PRIORITY event: {payload.get('event')} "
+                           f"for object {payload.get('object_id')}, priority {priority}")
+            else:
+                logging.info(f"Queued event: {payload.get('event')} "
+                           f"for object {payload.get('object_id')}, priority {priority}")
                 
         except json.JSONDecodeError:
             logging.error(f"Invalid JSON payload: {msg.payload}")
         except Exception as e:
             logging.error(f"Error in MQTT message handler: {e}", exc_info=True)
+            
+    def _calculate_event_priority(self, event):
+        """Calculate priority of event based on content (1-10, 10 highest)"""
+        # Base priority
+        priority = 5
+        
+        # Increase priority for certain event types
+        event_type = event.get('event', '').lower()
+        if 'license' in event_type or 'plate' in event_type:
+            priority += 3
+        elif 'vehicle' in event_type:
+            priority += 2
+        
+        # Higher priority for events with high confidence
+        confidence = event.get('confidence', 0)
+        if confidence > 0.8:
+            priority += 1
+        
+        # Ensure within range
+        return max(1, min(10, priority))
 
     def _event_processor(self):
         """Process events from the queue with frame synchronization"""
         while True:
             try:
-                # Get next event
-                event = self.event_queue.get(timeout=1.0)
+                # Get next event (with timeout to prevent blocking)
+                priority, receipt_time, event = self.event_queue.get(timeout=1.0)
+                
+                # Check if event is too old (5 seconds max age)
+                current_time = time.time()
+                if current_time - receipt_time > 5.0:
+                    logging.warning(f"Discarding stale event received {current_time - receipt_time:.1f}s ago")
+                    self.event_queue.task_done()
+                    continue
+                    
+                # Report queue backlog for performance monitoring
+                queue_size = self.event_queue.qsize()
+                if queue_size > 0:
+                    logging.info(f"Event queue backlog: {queue_size} events")
                 
                 # Process with precise timing
                 self._process_detection_event_precise(event)
@@ -122,7 +211,8 @@ class DetectionLogProcessor:
                 self.event_queue.task_done()
                 
             except queue.Empty:
-                time.sleep(0.01)  # Short sleep when no events
+                # Short sleep when no events
+                time.sleep(0.01)
             except Exception as e:
                 logging.error(f"Error in event processor: {e}", exc_info=True)
                 time.sleep(0.1)  # Longer sleep on error
@@ -136,7 +226,17 @@ class DetectionLogProcessor:
         
         # Extract timing information
         event_time = event.get('first_seen')
-        receipt_time = event.get('_receipt_time')
+        # Fix: Use the correct key name and add fallback if timestamp is missing
+        receipt_time = event.get('_received_time')
+        
+        if receipt_time is None:
+            # Fallback if _received_time is not available
+            receipt_time = event.get('_receipt_time')
+            
+        if receipt_time is None:
+            # Ultimate fallback - use current time
+            receipt_time = time.time()
+            logging.warning(f"No receipt timestamp found for event {event.get('object_id', 'unknown')}")
         
         if isinstance(event_time, str):
             try:
@@ -253,6 +353,7 @@ class DetectionLogProcessor:
                 
                 # Add frame timestamp to event for traceability
                 event['frame_timestamp'] = best_timestamp
+                # Safe calculation of processing latency
                 event['processing_latency'] = time.time() - receipt_time
                 
                 # Call snapshot callback
