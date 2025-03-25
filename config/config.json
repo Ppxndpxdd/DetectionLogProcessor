@@ -1,7 +1,7 @@
 {
     "buffer_size": 10,
     "unique_id": "Test",
-    "rtsp_url": "rtsp://161.246.5.10:9999/samui_front",
+    "rtsp_url": "rtsp://fasnet.3bbddns.com:59198/samui_front",
     "mqtt_broker": "f8b13f71.ala.asia-southeast1.emqxsl.com",
     "mqtt_port": 8883,
     "mqtt_username": "PP",

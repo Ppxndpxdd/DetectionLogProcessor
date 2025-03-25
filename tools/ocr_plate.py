@@ -102,59 +102,6 @@ class OCRPlate:
         # This is a placeholder as we can't directly cache image processing
         # The real caching happens in predict() with image hashing
         pass
-        
-    def _preprocess_image(self, image):
-        """Enhance license plate image for better OCR"""
-        if not image:
-            return None
-            
-        try:
-            # Convert to numpy/OpenCV format if PIL
-            if isinstance(image, Image.Image):
-                img = np.array(image)
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            else:
-                img = image.copy()
-                
-            # Resize if too small
-            min_size = 150
-            height, width = img.shape[:2]
-            if width < min_size or height < min_size:
-                scale = min_size / min(width, height)
-                img = cv2.resize(img, (int(width * scale), int(height * scale)))
-                
-            # Convert to grayscale
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            
-            # Check if contrast enhancement is needed
-            mean_val = np.mean(gray)
-            std_val = np.std(gray)
-            
-            # Apply selective enhancements based on image properties
-            if std_val < 40:  # Low contrast
-                # CLAHE enhancement
-                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-                enhanced = clahe.apply(gray)
-            elif mean_val < 100:  # Too dark
-                # Increase brightness
-                enhanced = cv2.convertScaleAbs(gray, alpha=1.5, beta=30)
-            elif mean_val > 200:  # Too bright
-                # Reduce brightness, increase contrast
-                enhanced = cv2.convertScaleAbs(gray, alpha=1.2, beta=-20)
-            else:
-                # Use original grayscale
-                enhanced = gray
-                
-            # Convert back to RGB for model
-            enhanced_rgb = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
-            return enhanced_rgb
-            
-        except Exception as e:
-            logging.error(f"Error preprocessing OCR image: {e}")
-            # Return original image if enhancement fails
-            if isinstance(image, Image.Image):
-                return np.array(image)
-            return image
     
     def set_backlog(self, backlog_count):
         """Update processing backlog to adjust OCR parameters"""
@@ -170,7 +117,7 @@ class OCRPlate:
     
     def _simple_image_hash(self, image):
         """Create a simple hash of the image for caching"""
-        # FIX: Proper check for None or empty image
+        # Check for None or empty image
         if image is None:
             return None
             
@@ -212,11 +159,11 @@ class OCRPlate:
     
     def predict(self, image, object_id=None):
         """Predict license plate number and province with caching and optimization"""
-        # FIX: Proper check for None or empty image
+        # Check for None or empty image
         if image is None:
             return None, None
         
-        # FIX: Check dimensions for numpy arrays
+        # Check dimensions for numpy arrays
         if isinstance(image, np.ndarray):
             if image.size == 0 or image.shape[0] == 0 or image.shape[1] == 0:
                 return None, None
@@ -225,7 +172,7 @@ class OCRPlate:
         self.total_reads += 1
         
         try:
-            # FIX: Improved cache validation and retrieval
+            # Check cache for this object if ID provided
             if object_id and object_id in self.recent_plates:
                 with self.cache_lock:
                     cached_data = self.recent_plates[object_id]
@@ -234,7 +181,7 @@ class OCRPlate:
                         plate_number = cached_data.get('plate_number')
                         province = cached_data.get('province')
                         
-                        # FIX: Validate cached data is complete and valid
+                        # Validate cached data is complete and valid
                         if plate_number and province and plate_number != "Unknown":
                             self.cache_hits += 1
                             logging.info(f"Cache hit for object {object_id}: {plate_number} {province}")
@@ -242,14 +189,12 @@ class OCRPlate:
                         else:
                             logging.warning(f"Invalid cache data for object {object_id}, running prediction")
             
-            # Preprocess the image for better OCR
-            preprocessed = self._preprocess_image(image)
-            if preprocessed is None:
-                return None, None
-                
-            # FIX: Safely call image hash with proper error handling
+            # REMOVED: Preprocessing step - using raw image directly
+            # This speeds up processing by eliminating expensive image transformations
+            
+            # Generate image hash for cache checking
             try:
-                img_hash = self._simple_image_hash(preprocessed)
+                img_hash = self._simple_image_hash(image)
                 if img_hash is None:
                     logging.warning("Failed to generate image hash")
             except Exception as e:
@@ -278,20 +223,29 @@ class OCRPlate:
                             logging.info(f"Hash match for image: {plate_number} {province}")
                             return plate_number, province
             
+            # Ensure image is in correct format for the model
+            input_image = image
+            if isinstance(image, np.ndarray) and image.ndim == 3:
+                # Convert BGR to RGB if needed
+                if image.shape[2] == 3:
+                    # Check if the image needs color conversion (OpenCV uses BGR by default)
+                    if not isinstance(image, Image.Image):
+                        input_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
             # Run prediction with optimized settings
             results = self.model.predict(
-                preprocessed, 
+                input_image, 
                 device=self.device, 
                 verbose=False,
                 conf=self.confidence_threshold
             )
             
-            # FIX: Process results with safe tensor handling and character validation
+            # Process results with safe tensor handling and character validation
             if len(results) > 0 and results[0].boxes.data.shape[0] > 0:
                 main_class_bboxes = []
                 province_bboxes = []
                 
-                # FIX: Extract and categorize detections with safe tensor handling
+                # Extract and categorize detections with safe tensor handling
                 for i in range(results[0].boxes.data.shape[0]):
                     try:
                         # Safe extraction with .item() to convert tensor to Python scalar
@@ -325,7 +279,7 @@ class OCRPlate:
                     sorted_positions = sorted(positions, key=lambda p: p[2])
                     sorted_main_bboxes = [(idx, class_id) for idx, class_id, _ in sorted_positions]
                 
-                # FIX: Enhanced character validation for Thai characters
+                # Enhanced character validation for Thai characters
                 sorted_class_names = []
                 valid_char_count = 0
                 for _, class_id in sorted_main_bboxes:
@@ -365,7 +319,7 @@ class OCRPlate:
                                            key=lambda k: self.recent_plates[k]['timestamp'])
                             del self.recent_plates[oldest_key]
                 
-                # FIX: Ensure return values are never None
+                # Ensure return values are never None
                 self.successful_reads += 1
                 self.ocr_times.append(time.time() - start_time)
                 return plate_number if plate_number else None, province if province else "Unknown"
