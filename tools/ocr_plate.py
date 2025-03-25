@@ -1,0 +1,397 @@
+from ultralytics import YOLO
+import torch
+import time
+import logging
+import numpy as np
+from PIL import Image
+import cv2
+from functools import lru_cache
+from threading import RLock
+
+class OCRPlate:
+    def __init__(self, model_path, device='cpu'):
+        self.model = YOLO(model_path)
+        
+        # Device selection
+        if torch.backends.mps.is_available():
+            device = "mps"
+        # elif torch.cuda.is_available():
+        #     device = "cuda"
+        else:
+            device = "cpu"
+        
+        self.device = device
+        self.class_id_map = {i: str(i) for i in range(10)}
+        self.class_id_map.update({
+            10: 'ก', 11: 'ข', 12: 'ฃ', 13: 'ค', 14: 'ฅ', 15: 'ฆ', 16: 'ง', 17: 'จ', 18: 'ฉ', 19: 'ช',
+            20: 'ซ', 21: 'ฌ', 22: 'ญ', 23: 'ฎ', 24: 'ฏ', 25: 'ฐ', 26: 'ฑ', 27: 'ฒ', 28: 'ณ', 29: 'ด',
+            30: 'ต', 31: 'ถ', 32: 'ท', 33: 'ธ', 34: 'น', 35: 'บ', 36: 'ป', 37: 'ผ', 38: 'ฝ', 39: 'พ',
+            40: 'ฟ', 41: 'ภ', 42: 'ม', 43: 'ย', 44: 'ร', 45: 'ล', 46: 'ว', 47: 'ศ', 48: 'ษ', 49: 'ส',
+            50: 'ห', 51: 'ฬ', 52: 'อ', 53: 'ฮ'
+        })
+        
+        self.province_map = {i: province for i, province in enumerate([
+            'กรุงเทพมหานคร', 'กระบี่', 'กาญจนบุรี', 'กาฬสินธุ์', 'กำแพงเพชร', 'ขอนแก่น', 'จันทบุรี', 'ฉะเชิงเทรา', 'ชลบุรี', 'ชัยนาท',
+            'ชัยภูมิ', 'ชุมพร', 'เชียงราย', 'เชียงใหม่', 'ตรัง', 'ตราด', 'ตาก', 'นครนายก', 'นครปฐม', 'นครพนม',
+            'นครราชสีมา', 'นครศรีธรรมราช', 'นครสวรรค์', 'นนทบุรี', 'นราธิวาส', 'น่าน', 'บึงกาฬ', 'บุรีรัมย์', 'ปทุมธานี', 'ประจวบคีรีขันธ์',
+            'ปราจีนบุรี', 'ปัตตานี', 'พระนครศรีอยุธยา', 'พังงา', 'พัทลุง', 'พิจิตร', 'พิษณุโลก', 'เพชรบุรี', 'เพชรบูรณ์', 'แพร่',
+            'พะเยา', 'ภูเก็ต', 'มหาสารคาม', 'มุกดาหาร', 'แม่ฮ่องสอน', 'ยะลา', 'ยโสธร', 'ร้อยเอ็ด', 'ระนอง', 'ระยอง',
+            'ราชบุรี', 'ลพบุรี', 'ลำปาง', 'ลำพูน', 'เลย', 'ศรีสะเกษ', 'สกลนคร', 'สงขลา', 'สตูล', 'สมุทรปราการ',
+            'สมุทรสงคราม', 'สมุทรสาคร', 'สระแก้ว', 'สระบุรี', 'สิงห์บุรี', 'สุโขทัย', 'สุพรรณบุรี', 'สุราษฎร์ธานี', 'สุรินทร์', 'หนองคาย',
+            'หนองบัวลำภู', 'อ่างทอง', 'อุดรธานี', 'อุทัยธานี', 'อุตรดิตถ์', 'อุบลราชธานี', 'อำนาจเจริญ'
+        ], start=54)}
+        
+        # Performance tracking
+        self.total_reads = 0
+        self.successful_reads = 0
+        self.ocr_times = []
+        self.cache_hits = 0
+        self.cache_lock = RLock()
+        self.recent_plates = {}  # Cache recently seen plates by object_id
+        
+        # Adaptive parameters
+        self.confidence_threshold = 0.3  # Start with moderate confidence
+        self.backlog = 0  # Track processing backlog
+        
+        logging.info(f"OCR Plate initialized on {self.device} device")
+
+    def map_class_name(self, class_id):
+        """Safely map class ID to character, handling potential errors"""
+        try:
+            # Convert class_id to int to ensure proper lookup
+            class_id_int = int(class_id)
+            
+            # First try to get class name from model.names
+            model_class_name = self.model.names.get(class_id_int)
+            
+            # If model_class_name is valid, use it to lookup in class_id_map
+            if model_class_name is not None:
+                return self.class_id_map.get(int(model_class_name), '')
+            
+            # If not found in model.names, try direct lookup in class_id_map
+            return self.class_id_map.get(class_id_int, '')
+        except Exception as e:
+            logging.warning(f"Error mapping class name for ID {class_id}: {e}")
+            return ''
+        
+    def map_province_name(self, class_id):
+        """Safely map class ID to province name, handling potential errors"""
+        try:
+            # Convert class_id to int to ensure proper lookup
+            class_id_int = int(class_id)
+            
+            # First try to get class name from model.names
+            model_class_name = self.model.names.get(class_id_int)
+            
+            # If model_class_name is valid, use it to lookup in province_map
+            if model_class_name is not None:
+                return self.province_map.get(int(model_class_name), 'Unknown')
+            
+            # If not found in model.names, try direct lookup in province_map
+            return self.province_map.get(class_id_int, 'Unknown')
+        except Exception as e:
+            logging.warning(f"Error mapping province name for ID {class_id}: {e}")
+            return 'Unknown'
+        
+    @lru_cache(maxsize=50)
+    def _cache_predict(self, image_hash):
+        """Cache prediction results based on image hash"""
+        # This is a placeholder as we can't directly cache image processing
+        # The real caching happens in predict() with image hashing
+        pass
+        
+    def _preprocess_image(self, image):
+        """Enhance license plate image for better OCR"""
+        if not image:
+            return None
+            
+        try:
+            # Convert to numpy/OpenCV format if PIL
+            if isinstance(image, Image.Image):
+                img = np.array(image)
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            else:
+                img = image.copy()
+                
+            # Resize if too small
+            min_size = 150
+            height, width = img.shape[:2]
+            if width < min_size or height < min_size:
+                scale = min_size / min(width, height)
+                img = cv2.resize(img, (int(width * scale), int(height * scale)))
+                
+            # Convert to grayscale
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            # Check if contrast enhancement is needed
+            mean_val = np.mean(gray)
+            std_val = np.std(gray)
+            
+            # Apply selective enhancements based on image properties
+            if std_val < 40:  # Low contrast
+                # CLAHE enhancement
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+                enhanced = clahe.apply(gray)
+            elif mean_val < 100:  # Too dark
+                # Increase brightness
+                enhanced = cv2.convertScaleAbs(gray, alpha=1.5, beta=30)
+            elif mean_val > 200:  # Too bright
+                # Reduce brightness, increase contrast
+                enhanced = cv2.convertScaleAbs(gray, alpha=1.2, beta=-20)
+            else:
+                # Use original grayscale
+                enhanced = gray
+                
+            # Convert back to RGB for model
+            enhanced_rgb = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+            return enhanced_rgb
+            
+        except Exception as e:
+            logging.error(f"Error preprocessing OCR image: {e}")
+            # Return original image if enhancement fails
+            if isinstance(image, Image.Image):
+                return np.array(image)
+            return image
+    
+    def set_backlog(self, backlog_count):
+        """Update processing backlog to adjust OCR parameters"""
+        self.backlog = backlog_count
+        
+        # Adjust confidence threshold based on backlog
+        if backlog_count > 10:
+            self.confidence_threshold = 0.4  # Higher confidence to speed up
+        elif backlog_count > 5:
+            self.confidence_threshold = 0.35
+        else:
+            self.confidence_threshold = 0.3  # Normal operation
+    
+    def _simple_image_hash(self, image):
+        """Create a simple hash of the image for caching"""
+        # FIX: Proper check for None or empty image
+        if image is None:
+            return None
+            
+        # Check numpy array dimensions
+        if isinstance(image, np.ndarray) and (image.size == 0 or image.shape[0] == 0 or image.shape[1] == 0):
+            return None
+            
+        try:
+            # Resize to tiny version for hashing
+            if isinstance(image, Image.Image):
+                small_img = image.resize((16, 16)).convert('L')
+                img_array = np.array(small_img)
+            else:
+                # Ensure image has proper dimensions
+                if len(image.shape) < 2:
+                    return None
+                    
+                small_img = cv2.resize(image, (16, 16))
+                if len(small_img.shape) == 3:
+                    img_array = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
+                else:
+                    img_array = small_img
+                    
+            # Simple hash: flatten and threshold
+            flat = img_array.flatten()
+            # Use mean as threshold
+            avg = np.mean(flat)
+            bits = flat > avg
+            # Convert to a 64-bit integer
+            h = 0
+            for bit in bits[:64]:  # Use first 64 bits
+                h = (h << 1) | int(bit)
+                
+            return h
+            
+        except Exception as e:
+            logging.error(f"Error creating image hash: {e}", exc_info=True)
+            return None
+    
+    def predict(self, image, object_id=None):
+        """Predict license plate number and province with caching and optimization"""
+        # FIX: Proper check for None or empty image
+        if image is None:
+            return None, None
+        
+        # FIX: Check dimensions for numpy arrays
+        if isinstance(image, np.ndarray):
+            if image.size == 0 or image.shape[0] == 0 or image.shape[1] == 0:
+                return None, None
+            
+        start_time = time.time()
+        self.total_reads += 1
+        
+        try:
+            # FIX: Improved cache validation and retrieval
+            if object_id and object_id in self.recent_plates:
+                with self.cache_lock:
+                    cached_data = self.recent_plates[object_id]
+                    # Check if cache entry is fresh (less than 10 seconds old)
+                    if time.time() - cached_data['timestamp'] < 10.0:
+                        plate_number = cached_data.get('plate_number')
+                        province = cached_data.get('province')
+                        
+                        # FIX: Validate cached data is complete and valid
+                        if plate_number and province and plate_number != "Unknown":
+                            self.cache_hits += 1
+                            logging.info(f"Cache hit for object {object_id}: {plate_number} {province}")
+                            return plate_number, province
+                        else:
+                            logging.warning(f"Invalid cache data for object {object_id}, running prediction")
+            
+            # Preprocess the image for better OCR
+            preprocessed = self._preprocess_image(image)
+            if preprocessed is None:
+                return None, None
+                
+            # FIX: Safely call image hash with proper error handling
+            try:
+                img_hash = self._simple_image_hash(preprocessed)
+                if img_hash is None:
+                    logging.warning("Failed to generate image hash")
+            except Exception as e:
+                logging.error(f"Image hash generation failed: {e}")
+                img_hash = None
+            
+            # Only check hash cache if we successfully generated a hash
+            if img_hash is not None:
+                # Check if we've seen this exact image recently
+                with self.cache_lock:
+                    for obj_id, data in self.recent_plates.items():
+                        if data.get('image_hash') == img_hash:
+                            self.cache_hits += 1
+                            plate_number = data['plate_number']
+                            province = data['province']
+                            
+                            # Update cache for current object
+                            if object_id:
+                                self.recent_plates[object_id] = {
+                                    'plate_number': plate_number,
+                                    'province': province,
+                                    'timestamp': time.time(),
+                                    'image_hash': img_hash
+                                }
+                                
+                            logging.info(f"Hash match for image: {plate_number} {province}")
+                            return plate_number, province
+            
+            # Run prediction with optimized settings
+            results = self.model.predict(
+                preprocessed, 
+                device=self.device, 
+                verbose=False,
+                conf=self.confidence_threshold
+            )
+            
+            # FIX: Process results with safe tensor handling and character validation
+            if len(results) > 0 and results[0].boxes.data.shape[0] > 0:
+                main_class_bboxes = []
+                province_bboxes = []
+                
+                # FIX: Extract and categorize detections with safe tensor handling
+                for i in range(results[0].boxes.data.shape[0]):
+                    try:
+                        # Safe extraction with .item() to convert tensor to Python scalar
+                        cls_tensor = results[0].boxes.cls[i]
+                        class_id = int(cls_tensor.item() if hasattr(cls_tensor, 'item') else int(cls_tensor))
+                        
+                        # Store detection with box
+                        if class_id <= 53:  # Characters
+                            main_class_bboxes.append((i, class_id))
+                        else:  # Province
+                            province_bboxes.append((i, class_id))
+                    except Exception as e:
+                        logging.warning(f"Error processing detection {i}: {e}")
+                        continue
+                
+                # Sort characters by x-position
+                sorted_main_bboxes = []
+                if main_class_bboxes:
+                    # Safe extraction and sorting of x positions
+                    positions = []
+                    for idx, class_id in main_class_bboxes:
+                        try:
+                            # Safely extract x coordinate
+                            x_coord = results[0].boxes.xywh[idx][0]
+                            x_value = float(x_coord.item() if hasattr(x_coord, 'item') else x_coord)
+                            positions.append((idx, class_id, x_value))
+                        except Exception as e:
+                            logging.warning(f"Error extracting position for {idx}: {e}")
+                    
+                    # Sort by x position
+                    sorted_positions = sorted(positions, key=lambda p: p[2])
+                    sorted_main_bboxes = [(idx, class_id) for idx, class_id, _ in sorted_positions]
+                
+                # FIX: Enhanced character validation for Thai characters
+                sorted_class_names = []
+                valid_char_count = 0
+                for _, class_id in sorted_main_bboxes:
+                    char = self.map_class_name(class_id)
+                    if char:  # Only add non-empty characters
+                        sorted_class_names.append(char)
+                        valid_char_count += 1
+                
+                # Require at least 2 valid characters for a plate number
+                if valid_char_count >= 2:
+                    plate_number = ''.join(sorted_class_names)
+                else:
+                    plate_number = "Unknown"
+                
+                # Get province with validation
+                province = "Unknown"
+                if province_bboxes:
+                    _, province_class_id = province_bboxes[0]
+                    province = self.map_province_name(province_class_id)
+                    # Verify province is a valid string
+                    if not isinstance(province, str) or not province:
+                        province = "Unknown"
+                
+                # Cache result if object_id provided
+                if object_id and plate_number != "Unknown" and province != "Unknown":
+                    with self.cache_lock:
+                        self.recent_plates[object_id] = {
+                            'plate_number': plate_number,
+                            'province': province if province else "Unknown",  # Ensure province is never None
+                            'timestamp': time.time(),
+                            'image_hash': img_hash
+                        }
+                        
+                        # Maintain cache size
+                        if len(self.recent_plates) > 100:
+                            oldest_key = min(self.recent_plates.keys(), 
+                                           key=lambda k: self.recent_plates[k]['timestamp'])
+                            del self.recent_plates[oldest_key]
+                
+                # FIX: Ensure return values are never None
+                self.successful_reads += 1
+                self.ocr_times.append(time.time() - start_time)
+                return plate_number if plate_number else None, province if province else "Unknown"
+            else:
+                return None, None
+                
+        except Exception as e:
+            logging.error(f"Error in OCR prediction: {e}", exc_info=True)
+            return None, None
+            
+    def get_stats(self):
+        """Return performance statistics"""
+        if not self.ocr_times:
+            return {
+                "avg_time": 0, 
+                "success_rate": 0, 
+                "device": self.device, 
+                "cache_hit_rate": 0
+            }
+            
+        stats = {
+            "avg_time": sum(self.ocr_times[-50:]) / max(len(self.ocr_times[-50:]), 1),
+            "success_rate": self.successful_reads / max(self.total_reads, 1) * 100,
+            "total_reads": self.total_reads,
+            "successful_reads": self.successful_reads,
+            "device": self.device,
+            "confidence": self.confidence_threshold,
+            "cache_hits": self.cache_hits,
+            "cache_hit_rate": self.cache_hits / max(self.total_reads, 1) * 100,
+            "backlog": self.backlog
+        }
+        return stats
