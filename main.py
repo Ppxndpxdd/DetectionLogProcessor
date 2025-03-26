@@ -12,12 +12,52 @@ from typing import Dict, Any
 import platform
 import psutil
 import concurrent.futures
+import database_connect.postgres as db
+import generate_config.generate_config as config
+
+from minio import Minio
+from minio.error import S3Error
 
 from tools.detection_log_processor import DetectionLogProcessor
 from tools.plate_detector import PlateDetector
 from tools.ocr_plate import OCRPlate
 from tools.frame_buffer import TimeSyncedFrameBuffer
 from tools.ocr_processor_pool import OCRProcessorPool
+
+def set_variable_from_config():
+    # Global variables for all configuration settings
+    global broker, port, topic, client_id, username, password, ca_cert
+    global plate_weight, ocr_weight
+    global minio_endpoint, minio_access_key, minio_secret_key
+    global output_dir, buffer_size, performance_monitor_config_path
+    global default_rtsp_url  # Add default RTSP URL
+    
+    # MQTT configuration
+    config_data = config.read_mqtt_config("config/subscribe_incident_config.ini")
+    broker = config_data['broker']
+    port = config_data['port']
+    topic = config_data['topic']
+    client_id = config_data['client_id']
+    username = config_data['username']
+    password = config_data['password']
+    ca_cert = config_data['ca_certs_path']
+    
+    # Model weights configuration
+    config_data = config.read_model_weight_config("config/model_weight_config.ini")
+    output_dir = config_data['output_dir']
+    buffer_size = int(config_data.get('buffer_size', 30))
+    plate_weight = config_data['plate_weight_path']
+    ocr_weight = config_data['ocr_weight_path']
+    default_rtsp_url = config_data.get('default_rtsp_url', 'rtsp://161.246.5.10:9999/samui_front')  # Get default RTSP URL
+    
+    # Minio configuration
+    config_data = config.read_minio_config("config/minio_config.ini")
+    minio_endpoint = config_data['endpoint']
+    minio_access_key = config_data['access_key']
+    minio_secret_key = config_data['secret_key']
+    
+    # Performance monitor configuration path
+    performance_monitor_config_path = "config/config.json"
 
 # Configure logging with microsecond precision for timing analysis
 logging.basicConfig(
@@ -26,12 +66,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler()]
 )
-
-# --- Load configuration from config.json ---
-with open("config/config.json", "r") as f:
-    config = json.load(f)
-
-os.makedirs(config["output_dir"], exist_ok=True)
 
 # Global logs and locks
 detection_log_list = []
@@ -47,8 +81,31 @@ metrics_lock = threading.RLock()
 # Shutdown event for clean termination
 shutdown_event = threading.Event()
 
+# Global variables for configuration settings
+broker = None
+port = None
+topic = None
+client_id = None
+username = None
+password = None
+ca_cert = None
+plate_weight = None
+ocr_weight = None
+minio_endpoint = None
+minio_access_key = None
+minio_secret_key = None
+output_dir = None
+buffer_size = 30  # Default value
+performance_monitor_config_path = None
+default_rtsp_url = None  # Default RTSP URL
+
+# Map to store marker_id to rtsp_url mappings
+rtsp_url_cache = {}
+rtsp_url_cache_lock = threading.RLock()
+
 # Create the shared frame buffer between pipelines
-frame_buffer = TimeSyncedFrameBuffer(max_size=config.get("buffer_size", 30))
+# Will be initialized after loading config
+frame_buffer = None
 
 # Global reference to components
 rtsp_reader = None
@@ -61,6 +118,49 @@ detection_logs = []
 detection_log_lock = threading.RLock()
 detection_log_last_save_time = time.time()
 detection_log_save_interval = 30  # Seconds between saves
+
+# Function to update or get RTSP URL for a marker_id
+def get_rtsp_url_for_marker(marker_id):
+    """Get RTSP URL for a given marker ID, either from cache or from database"""
+    with rtsp_url_cache_lock:
+        # Check if we already have this marker's URL cached
+        if marker_id in rtsp_url_cache:
+            return rtsp_url_cache[marker_id]
+        
+        # If not, try to get it from the database
+        try:
+            nvr_link = db.get_nvr_link_by_marker_id(marker_id)
+            if nvr_link:
+                logging.info(f"Retrieved NVR link for marker {marker_id}: {nvr_link}")
+                rtsp_url_cache[marker_id] = nvr_link
+                return nvr_link
+        except Exception as e:
+            logging.error(f"Error retrieving NVR link for marker {marker_id}: {e}")
+    
+    # If we couldn't get a specific URL, use the default
+    return default_rtsp_url
+
+def update_rtsp_reader_for_marker(marker_id):
+    """Update the RTSP reader to use the URL for a specific marker"""
+    global rtsp_reader
+    
+    # Get the appropriate RTSP URL
+    rtsp_url = get_rtsp_url_for_marker(marker_id)
+    
+    if not rtsp_url:
+        logging.warning(f"No RTSP URL available for marker {marker_id}, using current stream")
+        return False
+    
+    # If we have an RTSP reader and it's using a different URL, update it
+    if rtsp_reader and rtsp_reader.rtsp_url != rtsp_url:
+        try:
+            logging.info(f"Switching RTSP stream to {rtsp_url} for marker {marker_id}")
+            rtsp_reader.update_rtsp_url(rtsp_url)
+            return True
+        except Exception as e:
+            logging.error(f"Failed to update RTSP URL: {e}", exc_info=True)
+            return False
+    return True
 
 # Set process and thread priorities
 def set_high_priority():
@@ -139,6 +239,12 @@ def mqtt_callback(original_snapshot, event):
         # Store event in logs
         detection_log_list.append(event.copy())
         
+        # Check if we need to update the RTSP URL for this marker
+        marker_id = event.get('marker_id')
+        if marker_id:
+            # Update the RTSP reader to use the right camera stream for this marker
+            update_rtsp_reader_for_marker(marker_id)
+        
         # Process the cropped image for plate detection
         if original_snapshot is not None:
             # Convert to OpenCV format if needed
@@ -158,6 +264,30 @@ def mqtt_callback(original_snapshot, event):
         
     except Exception as e:
         logging.error(f"Error in MQTT callback: {e}", exc_info=True)
+
+class MinioUpload:
+    def __init__(self, endpoint, access_key, secret_key, secure=False):
+        self.client = Minio(
+            endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            secure=secure
+        )
+
+    def upload_file(self, source_file, destination_file, bucket_name):
+        try:
+            if not self.client.bucket_exists(bucket_name):
+                self.client.make_bucket(bucket_name)
+                print(f"Created bucket: {bucket_name}")
+            else:
+                print(f"Bucket {bucket_name} already exists")
+
+            self.client.fput_object(bucket_name, destination_file, source_file)
+            print(f"{source_file} successfully uploaded as {destination_file} to bucket {bucket_name}")
+            return True
+        except S3Error as exc:
+            print("Error occurred:", exc)
+            return False
 
 # Pipeline for plate processing
 class PlateProcessingPipeline:
@@ -190,26 +320,34 @@ class PlateProcessingPipeline:
     
     def _ocr_result_callback(self, plate_number, province, object_id, event_data):
         """Handle OCR results from the dedicated OCR pool and save to detection logs"""
-        if not plate_number or not province:
-            logging.warning(f"OCR failed for object {object_id}")
+        output_path = event_data.get('output_image_path')
+        if output_path is None and 'original_event' in event_data:
+            output_path = event_data.get('original_event', {}).get('output_image_path')
+        print(f"output_path is {output_path}")
+
+        incident_id = event_data.get('incident_id')
+        if incident_id is None and 'original_event' in event_data:
+            incident_id = event_data.get('original_event', {}).get('incident_id')
             
-            # Log failed OCR attempts too
-            with detection_log_lock:
-                detection_log = {
-                    "object_id": object_id,
-                    "timestamp": time.time(),
-                    "event_time": event_data.get('event_time'),
-                    "ocr_success": False,
-                    "event_type": event_data.get('original_event', {}).get('event', 'unknown'),
-                    "detection_confidence": event_data.get('confidence', 0),
-                    "processing_latency": time.time() - event_data.get('processing_start', time.time()),
-                    "ocr_status": "failed"
-                }
-                detection_logs.append(detection_log)
-            
-            return
-            
-        # Process successful OCR result
+        print(f"incident_id is {incident_id}")
+        nvr_link = event_data.get('nvr_link')
+        marker_id = event_data.get('original_event', {}).get('marker_id')
+        
+        # Create result record regardless of OCR success
+        result = {
+            "object_id": object_id,
+            "event_time": event_data.get('event_time'),
+            "processing_time": time.time(),
+            "plate_number": plate_number if plate_number else "Unknown",
+            "province": province if province else "Unknown",
+            "confidence": event_data.get('confidence', 0),
+            "image_path": output_path,
+            "incident_id": incident_id,
+            "nvr_link": nvr_link,
+            "marker_id": marker_id
+        }
+        
+        # Process OCR result
         try:
             # Get timing data from the event
             event_time = event_data.get('event_time')
@@ -220,83 +358,101 @@ class PlateProcessingPipeline:
             total_time = time.time() - processing_start if processing_start else 0
             ocr_time = total_time - detection_time if detection_time else 0
             
-            # Create result record
-            result = {
-                "object_id": object_id,
-                "event_time": event_time,
-                "processing_time": time.time(),
-                "plate_number": plate_number,
-                "province": province,
-                "confidence": event_data.get('confidence', 0),
-                "processing_latency": total_time,
-                "detection_time": detection_time,
-                "ocr_time": ocr_time,
-                "event": event_data.get('original_event', {}).copy()
-            }
+            # Log the appropriate message based on OCR success
+            if plate_number and plate_number != "Unknown":
+                if province and province != "Unknown":
+                    logging.info(f"OCR successful - plate {plate_number}, province {province}")
+                else:
+                    logging.info(f"OCR partially successful - plate {plate_number} without province")
+            else:
+                logging.warning(f"OCR failed for object {object_id}")
+            
+            # Update the incident record in the database regardless of OCR success
+            # Following the exact pattern from incident_subscribe.py
+            if incident_id:
+                try:
+                    # Set image path based on whether plate was found (exact match with incident_subscribe.py)
+                    image_path = str(incident_id) + ".jpg" if plate_number and plate_number != "Unknown" else "No image"
+                    
+                    # Update the incident in the database
+                    db.update_incident(image_path, incident_id, plate_number, province)
+                    logging.info(f"Updated incident {incident_id} with image {image_path}, plate {plate_number}, province {province}")
+                except Exception as e:
+                    logging.error(f"Failed to update incident: {e}", exc_info=True)
+            # Upload image to Minio if output_path exists
+            if output_path and os.path.exists(output_path):
+                try:
+                    # Use global Minio config variables 
+                    global minio_endpoint, minio_access_key, minio_secret_key
+                    if minio_endpoint and minio_access_key and minio_secret_key:
+                        minio_client = MinioUpload(
+                            endpoint=minio_endpoint,
+                            access_key=minio_access_key,
+                            secret_key=minio_secret_key,
+                            secure=False  # Configure this as needed
+                        )
+                        
+                        # Upload to Minio with appropriate naming
+                        bucket_name = 'incident-image'  # You might want to make this configurable too
+                        
+                        # Use the same image path as in the database
+                        if incident_id:
+                            destination = str(incident_id) + ".jpg"
+                            logging.info(f"Using image path {destination} for Minio upload")
+                        else:
+                            # Fallback to previous format if no incident_id is available
+                            destination = f"plates_{object_id}.jpg"
+                            logging.info(f"No incident ID available, using default naming format")
+                        
+                        if minio_client.upload_file(output_path, destination, bucket_name):
+                            logging.info(f"Successfully uploaded image to Minio: {destination}")
+                            result["minio_path"] = destination
+                            
+                            # Remove local file after successful upload
+                            try:
+                                os.remove(output_path)
+                                logging.info(f"Removed local file: {output_path}")
+                            except Exception as e:
+                                logging.warning(f"Failed to remove local file {output_path}: {e}")
+                        else:
+                            logging.error(f"Failed to upload image to Minio: {output_path}")
+                except Exception as e:
+                    logging.error(f"Minio upload error: {e}", exc_info=True)
             
             # Calculate end-to-end latency
             if event_time:
-                result["event_to_detection_latency"] = time.time() - event_time
+                end_to_end_latency = time.time() - event_time
+                result["end_to_end_latency"] = end_to_end_latency
             
             # Save results
             with file_lock:
                 processed_results.append(result)
-                
-                # Save to file periodically
-                if len(processed_results) % 5 == 0:
-                    output_file = os.path.join(config["output_dir"], "results.json")
-                    try:
-                        with open(output_file, "w", encoding="utf-8") as f:
-                            json.dump(processed_results, f, ensure_ascii=False)
-                    except Exception as e:
-                        logging.error(f"Error saving results: {e}")
             
             # Add to detection logs with OCR output
             with detection_log_lock:
-                detection_log = {
+                ocr_log = {
                     "object_id": object_id,
                     "timestamp": time.time(),
-                    "event_time": event_time,
-                    "ocr_success": True,
-                    "plate_number": plate_number,
-                    "province": province,
-                    "detection_confidence": event_data.get('confidence', 0),
-                    "processing_latency": total_time,
-                    "detection_time": detection_time,
+                    "plate_number": plate_number if plate_number else "Unknown",
+                    "province": province if province else "Unknown",
+                    "ocr_success": bool(plate_number and plate_number != "Unknown"),
                     "ocr_time": ocr_time,
-                    "event_type": event_data.get('original_event', {}).get('event', 'unknown'),
-                    "ocr_status": "success",
-                    "frame_timestamp": event_data.get('timestamp'),
-                    "rtsp_frame_count": event_data.get('original_event', {}).get('frame_count', 0)
+                    "total_processing_time": total_time,
+                    "event_phase": "ocr_complete",
+                    "minio_path": result.get("minio_path"),
+                    "incident_id": incident_id,
+                    "nvr_link": nvr_link
                 }
-                detection_logs.append(detection_log)
-                
-                # Check if we should save logs
-                if time.time() - detection_log_last_save_time > detection_log_save_interval:
-                    save_detection_logs()
-            
-            # Log results
-            logging.info(f"Successfully processed: {plate_number} {province} | "
-                      f"Obj: {object_id} | "
-                      f"Time: {total_time*1000:.1f}ms ({detection_time*1000:.1f}ms detect, "
-                      f"{ocr_time*1000:.1f}ms OCR)")
+                detection_logs.append(ocr_log)
             
             # Record metrics for monitoring
             update_metrics(processing_times, total_time)
             
-            # Save plate image for verification if available
-            plate_img = event_data.get('plate_img')
-            if plate_img:
-                try:
-                    timestamp_str = datetime.fromtimestamp(event_data.get('timestamp', time.time())).strftime('%Y%m%d_%H%M%S')
-                    filename = f"plate_{plate_number}_{object_id}_{timestamp_str}.jpg"
-                    save_path = os.path.join(config["output_dir"], filename)
-                    plate_img.save(save_path)
-                except Exception as e:
-                    logging.error(f"Error saving plate image: {e}")
-                    
         except Exception as e:
             logging.error(f"Error processing OCR result: {e}", exc_info=True)
+            
+        # Return the plate_number and province for use in main
+        return plate_number, province
     
     def _processing_worker(self):
         """Worker thread that processes frames with parallel OCR handling"""
@@ -334,6 +490,12 @@ class PlateProcessingPipeline:
                     start_time = time.time()
                     object_id = event.get('object_id', 'unknown')
                     
+                    # Check if we have a marker_id and need to update RTSP URL
+                    marker_id = event.get('marker_id')
+                    if marker_id:
+                        # Ensure we're using the right camera stream
+                        update_rtsp_reader_for_marker(marker_id)
+                    
                     # Update adaptive parameters
                     backlog_count = frame_buffer.get_stats()['unprocessed']
                     self.plate_detector.set_backlog(backlog_count)
@@ -353,7 +515,12 @@ class PlateProcessingPipeline:
                     detection_time = time.time() - start_time
                     
                     if plate_img is not None:
-                        # New: Add detection to batch
+                        # Gather nvr_link information if available
+                        nvr_link = None
+                        if marker_id:
+                            nvr_link = get_rtsp_url_for_marker(marker_id)
+                            
+                        # New: Add detection to batch with nvr_link
                         detection_data = {
                             'plate_img': plate_img,
                             'object_id': object_id,
@@ -362,17 +529,26 @@ class PlateProcessingPipeline:
                             'confidence': event.get('confidence', 0),
                             'detection_time': detection_time,
                             'processing_start': start_time,
-                            'original_event': event.copy()
+                            'original_event': event.copy(),
+                            'nvr_link': nvr_link
                         }
                         
                         detection_batch.append(detection_data)
                         logging.info(f"License plate detected for obj {object_id} in {detection_time*1000:.1f}ms, queued for OCR")
+                        
+                        if plate_img is not None:
+                            logging.info(f"License plate detected for obj {object_id} in {detection_time*1000:.1f}ms, queued for OCR")
+                        else:
+                            logging.warning(f"No license plate detected for obj {object_id}, but updating incident anyway")
                         
                         # Process batch when it reaches size or when high priority
                         if len(detection_batch) >= batch_size or event.get('confidence', 0) > 0.8:
                             self._process_detection_batch(detection_batch, executor)
                             detection_batch = []
                             last_batch_time = time.time()
+                            
+                    else:
+                        logging.warning(f"No license plate detected for obj {object_id}")
                 except Exception as e:
                     logging.error(f"Error in processing worker: {e}", exc_info=True)
                     consecutive_errors += 1
@@ -385,45 +561,40 @@ class PlateProcessingPipeline:
         if not batch:
             return
             
-        # Submit all OCR tasks to the executor
-        future_to_detection = {
-            executor.submit(
-                self.ocr_plate.predict, 
-                detection['plate_img'], 
-                detection['object_id']
-            ): detection for detection in batch
-        }
+        # Submit only valid plate images to OCR, handle None cases directly
+        future_to_detection = {}
+        for detection in batch:
+            if detection['plate_img'] is not None:
+                # Only submit valid images to OCR
+                future = executor.submit(
+                    self.ocr_plate.predict, 
+                    detection['plate_img'], 
+                    detection['object_id']
+                )
+                future_to_detection[future] = detection
+            else:
+                # For None plate_img, directly call callback with "Unknown"
+                object_id = detection.get('object_id', 'unknown')
+                # Skip OCR and directly handle as "Unknown" result
+                self._ocr_result_callback("Unknown", "Unknown", object_id, detection)
+                logging.info(f"Directly handling None plate_img for obj {object_id} as 'Unknown'")
         
         # Process results as they complete
         for future in concurrent.futures.as_completed(future_to_detection):
             detection = future_to_detection[future]
             try:
                 plate_number, province = future.result()
+                object_id = detection.get('object_id', 'unknown')
                 
-                # FIX: Properly validate both plate number and province before callback
-                if plate_number and province and plate_number != "Unknown":
-                    # Create a result record
-                    event_data = detection
-                    self._ocr_result_callback(plate_number, province, detection['object_id'], event_data)
-                else:
-                    object_id = detection.get('object_id', 'unknown')
-                    # Give more detailed log about what's missing
-                    if not plate_number:
-                        logging.warning(f"OCR failed - no plate number for object {object_id}")
-                    elif plate_number == "Unknown":
-                        logging.warning(f"OCR failed - unknown plate for object {object_id}")
-                    elif not province:
-                        logging.warning(f"OCR failed - no province for object {object_id}")
-                    elif province == "Unknown":
-                        # Province unknown but plate OK is acceptable
-                        event_data = detection
-                        self._ocr_result_callback(plate_number, "Unknown", object_id, event_data)
-                        logging.info(f"OCR partially successful - plate {plate_number} without province")
-                        
+                # Create a result record (even with unsuccessful OCR)
+                event_data = detection
+                self._ocr_result_callback(plate_number, province, object_id, event_data)
+                
             except Exception as e:
                 logging.error(f"Error in OCR task: {e}", exc_info=True)
-
-# Update the metrics_reporter function
+                # Handle OCR exceptions by returning Unknown
+                object_id = detection.get('object_id', 'unknown')
+                self._ocr_result_callback("Unknown", "Unknown", object_id, detection)
 
 def metrics_reporter():
     """Thread that periodically logs performance metrics and saves detection logs"""
@@ -469,8 +640,8 @@ def initialize_performance_monitor():
     """Initialize and configure the performance monitoring system"""
     global performance_monitor
     
-    # Create monitor instance
-    performance_monitor = PerformanceMonitor(config_path="config/config.json")
+    # Create monitor instance using global config path
+    performance_monitor = PerformanceMonitor(config_path=performance_monitor_config_path)
     
     # Register system components
     if frame_buffer and processing_pipeline:
@@ -493,15 +664,16 @@ def save_detection_logs():
             return
             
         try:
-            output_file = os.path.join(config["output_dir"], "detection_log.json")
+            # Use global output_dir variable instead of config
+            global output_dir
+            os.makedirs(output_dir, exist_ok=True)
+            output_file = os.path.join(output_dir, "detection_log.json")
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(detection_logs, f, ensure_ascii=False)
             logging.info(f"Saved {len(detection_logs)} detection logs to {output_file}")
             detection_log_last_save_time = time.time()
         except Exception as e:
             logging.error(f"Error saving detection logs: {e}")
-
-# Add this function after save_detection_logs()
 
 def analyze_ocr_performance():
     """Analyze OCR performance statistics and log summary"""
@@ -534,26 +706,33 @@ def analyze_ocr_performance():
 
 def main():
     """Main entry point"""
-    global detection_processor, processing_pipeline
+    global detection_processor, processing_pipeline, frame_buffer, rtsp_reader
     
     try:
+        # Load all configuration variables
+        set_variable_from_config()
+        
+        # Initialize the frame buffer with buffer_size from config
+        frame_buffer = TimeSyncedFrameBuffer(max_size=buffer_size)
+        
         # Set main process to high priority
         set_high_priority()
         
         logging.info("Starting Enhanced License Plate Recognition System...")
         
-        # Initialize plate processing pipeline
+        # Initialize plate processing pipeline using global config variables
         logging.info("Initializing plate processing pipeline")
-        plate_model_path = config.get('plate_detector_model_path')
-        ocr_model_path = config.get('ocr_plate_model_path')
+        
+        # Use the global variables for model paths
+        global plate_weight, ocr_weight, default_rtsp_url
         
         # Determine optimal number of worker threads
         worker_threads = max(1, min(2, psutil.cpu_count(logical=False) - 1))
         logging.info(f"Using {worker_threads} worker threads for processing")
         
         processing_pipeline = PlateProcessingPipeline(
-            plate_model_path, 
-            ocr_model_path,
+            plate_weight,
+            ocr_weight,
             num_workers=worker_threads
         )
         
@@ -566,8 +745,25 @@ def main():
         metrics_thread.start()
         
         # Initialize detection processor with advanced frame synchronization
+        # Use MQTT config variables for DetectionLogProcessor
         logging.info("Initializing detection processor with real-time frame synchronization")
-        detection_processor = DetectionLogProcessor("config/config.json", mqtt_callback)
+        global broker, port, topic, client_id, username, password, ca_cert, output_dir, default_rtsp_url
+        
+        # Create the detection processor directly using global variables instead of via a config file
+        detection_processor = DetectionLogProcessor(
+            mqtt_broker=broker,
+            mqtt_port=port,
+            detection_topic=topic,
+            mqtt_username=username,
+            mqtt_password=password,
+            ca_cert_path=ca_cert,
+            output_dir=output_dir,
+            rtsp_url=default_rtsp_url,  # Start with default URL, will be updated dynamically
+            snapshot_callback=mqtt_callback
+        )
+        
+        # Store reference to rtsp_reader for updates
+        rtsp_reader = detection_processor.rtsp_reader
         
         # Initialize performance monitor
         initialize_performance_monitor()

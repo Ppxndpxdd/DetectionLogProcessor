@@ -1,3 +1,11 @@
 weight
 output
 __pycache__
+config/emqxsl-ca.crt
+config/minio_config.ini
+config/model_weight_config.ini
+config/postgres_config.ini
+config/publish_config.ini
+config/subscribe_config.ini
+config/subscribe_hearth_beat_config.ini
+config/subscribe_incident_config.ini
