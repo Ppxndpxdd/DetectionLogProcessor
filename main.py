@@ -320,6 +320,18 @@ class PlateProcessingPipeline:
     
     def _ocr_result_callback(self, plate_number, province, object_id, event_data):
         """Handle OCR results from the dedicated OCR pool and save to detection logs"""
+        # Only convert empty strings to None, but keep None values as None
+        if plate_number == "Unknown":
+            plate_number = None
+        if province == "Unknown":
+            province = None
+        
+        # Only convert empty strings to None, but keep None values as None
+        if plate_number == "":
+            plate_number = None
+        if province == "":
+            province = None
+        
         output_path = event_data.get('output_image_path')
         if output_path is None and 'original_event' in event_data:
             output_path = event_data.get('original_event', {}).get('output_image_path')
@@ -338,8 +350,8 @@ class PlateProcessingPipeline:
             "object_id": object_id,
             "event_time": event_data.get('event_time'),
             "processing_time": time.time(),
-            "plate_number": plate_number if plate_number else "Unknown",
-            "province": province if province else "Unknown",
+            "plate_number": plate_number if plate_number else None,
+            "province": province if province else None,
             "confidence": event_data.get('confidence', 0),
             "image_path": output_path,
             "incident_id": incident_id,
@@ -359,8 +371,8 @@ class PlateProcessingPipeline:
             ocr_time = total_time - detection_time if detection_time else 0
             
             # Log the appropriate message based on OCR success
-            if plate_number and plate_number != "Unknown":
-                if province and province != "Unknown":
+            if plate_number is not None:
+                if province is not None:
                     logging.info(f"OCR successful - plate {plate_number}, province {province}")
                 else:
                     logging.info(f"OCR partially successful - plate {plate_number} without province")
@@ -372,11 +384,15 @@ class PlateProcessingPipeline:
             if incident_id:
                 try:
                     # Set image path based on whether plate was found (exact match with incident_subscribe.py)
-                    image_path = str(incident_id) + ".jpg" if plate_number and plate_number != "Unknown" else "No image"
+                    image_path = str(incident_id) + ".jpg" if plate_number is not None else "No image"
                     
-                    # Update the incident in the database
-                    db.update_incident(image_path, incident_id, plate_number, province)
-                    logging.info(f"Updated incident {incident_id} with image {image_path}, plate {plate_number}, province {province}")
+                    # Convert None values to "No number" and "No province" for database
+                    db_plate_number = "No number" if plate_number is None else plate_number
+                    db_province = "No province" if province is None else province
+                    
+                    # Pass the properly formatted values to the database
+                    db.update_incident(image_path, incident_id, db_plate_number, db_province)
+                    logging.info(f"Updated incident {incident_id} with image {image_path}, plate {db_plate_number}, province {db_province}")
                 except Exception as e:
                     logging.error(f"Failed to update incident: {e}", exc_info=True)
             # Upload image to Minio if output_path exists
@@ -433,8 +449,8 @@ class PlateProcessingPipeline:
                 ocr_log = {
                     "object_id": object_id,
                     "timestamp": time.time(),
-                    "plate_number": plate_number if plate_number else "Unknown",
-                    "province": province if province else "Unknown",
+                    "plate_number": plate_number if plate_number else None,
+                    "province": province if province else None,
                     "ocr_success": bool(plate_number and plate_number != "Unknown"),
                     "ocr_time": ocr_time,
                     "total_processing_time": total_time,
@@ -450,9 +466,6 @@ class PlateProcessingPipeline:
             
         except Exception as e:
             logging.error(f"Error processing OCR result: {e}", exc_info=True)
-            
-        # Return the plate_number and province for use in main
-        return plate_number, province
     
     def _processing_worker(self):
         """Worker thread that processes frames with parallel OCR handling"""
@@ -573,11 +586,11 @@ class PlateProcessingPipeline:
                 )
                 future_to_detection[future] = detection
             else:
-                # For None plate_img, directly call callback with "Unknown"
+                # For None plate_img, directly call callback with "No number" and "No province"
                 object_id = detection.get('object_id', 'unknown')
-                # Skip OCR and directly handle as "Unknown" result
-                self._ocr_result_callback("Unknown", "Unknown", object_id, detection)
-                logging.info(f"Directly handling None plate_img for obj {object_id} as 'Unknown'")
+                # Skip OCR and directly handle as no plate detected
+                self._ocr_result_callback(None, None, object_id, detection)
+                logging.info(f"Directly handling None plate_img for obj {object_id} as undetected plate")
         
         # Process results as they complete
         for future in concurrent.futures.as_completed(future_to_detection):
@@ -586,15 +599,18 @@ class PlateProcessingPipeline:
                 plate_number, province = future.result()
                 object_id = detection.get('object_id', 'unknown')
                 
+                # Don't modify None values - pass them through
+                # (remove the sanitization code here)
+                
                 # Create a result record (even with unsuccessful OCR)
                 event_data = detection
                 self._ocr_result_callback(plate_number, province, object_id, event_data)
                 
             except Exception as e:
                 logging.error(f"Error in OCR task: {e}", exc_info=True)
-                # Handle OCR exceptions by returning Unknown
+                # For exceptions, still use None values
                 object_id = detection.get('object_id', 'unknown')
-                self._ocr_result_callback("Unknown", "Unknown", object_id, detection)
+                self._ocr_result_callback(None, None, object_id, detection)
 
 def metrics_reporter():
     """Thread that periodically logs performance metrics and saves detection logs"""
