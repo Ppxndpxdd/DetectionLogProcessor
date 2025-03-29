@@ -300,7 +300,7 @@ class PlateProcessingPipeline:
         self.ocr_plate = OCRPlate(ocr_model_path)
         
         # Create OCR processor pool for handling the OCR bottleneck
-        ocr_threads = max(1, min(3, psutil.cpu_count(logical=False)))
+        ocr_threads = max(16, min(3, psutil.cpu_count(logical=False)))
         self.ocr_pool = OCRProcessorPool(num_workers=ocr_threads, ocr_instance=self.ocr_plate)
         
         # Start worker threads
@@ -743,7 +743,7 @@ def main():
         global plate_weight, ocr_weight, default_rtsp_url
         
         # Determine optimal number of worker threads
-        worker_threads = max(1, min(2, psutil.cpu_count(logical=False) - 1))
+        worker_threads = max(16, min(2, psutil.cpu_count(logical=False) - 1))
         logging.info(f"Using {worker_threads} worker threads for processing")
         
         processing_pipeline = PlateProcessingPipeline(

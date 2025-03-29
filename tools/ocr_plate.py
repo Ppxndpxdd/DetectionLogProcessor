@@ -53,7 +53,7 @@ class OCRPlate:
         self.recent_plates = {}  # Cache recently seen plates by object_id
         
         # Adaptive parameters
-        self.confidence_threshold = 0.3  # Start with moderate confidence
+        self.confidence_threshold = 0.1  # Start with moderate confidence
         self.backlog = 0  # Track processing backlog
         
         logging.info(f"OCR Plate initialized on {self.device} device")
@@ -115,48 +115,6 @@ class OCRPlate:
         else:
             self.confidence_threshold = 0.3  # Normal operation
     
-    def _simple_image_hash(self, image):
-        """Create a simple hash of the image for caching"""
-        # Check for None or empty image
-        if image is None:
-            return None
-            
-        # Check numpy array dimensions
-        if isinstance(image, np.ndarray) and (image.size == 0 or image.shape[0] == 0 or image.shape[1] == 0):
-            return None
-            
-        try:
-            # Resize to tiny version for hashing
-            if isinstance(image, Image.Image):
-                small_img = image.resize((16, 16)).convert('L')
-                img_array = np.array(small_img)
-            else:
-                # Ensure image has proper dimensions
-                if len(image.shape) < 2:
-                    return None
-                    
-                small_img = cv2.resize(image, (16, 16))
-                if len(small_img.shape) == 3:
-                    img_array = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
-                else:
-                    img_array = small_img
-                    
-            # Simple hash: flatten and threshold
-            flat = img_array.flatten()
-            # Use mean as threshold
-            avg = np.mean(flat)
-            bits = flat > avg
-            # Convert to a 64-bit integer
-            h = 0
-            for bit in bits[:64]:  # Use first 64 bits
-                h = (h << 1) | int(bit)
-                
-            return h
-            
-        except Exception as e:
-            logging.error(f"Error creating image hash: {e}", exc_info=True)
-            return None
-    
     def predict(self, image, object_id=None):
         """Predict license plate number and province with caching and optimization"""
         # Check for None or empty image
@@ -191,37 +149,6 @@ class OCRPlate:
             
             # REMOVED: Preprocessing step - using raw image directly
             # This speeds up processing by eliminating expensive image transformations
-            
-            # Generate image hash for cache checking
-            try:
-                img_hash = self._simple_image_hash(image)
-                if img_hash is None:
-                    logging.warning("Failed to generate image hash")
-            except Exception as e:
-                logging.error(f"Image hash generation failed: {e}")
-                img_hash = None
-            
-            # Only check hash cache if we successfully generated a hash
-            if img_hash is not None:
-                # Check if we've seen this exact image recently
-                with self.cache_lock:
-                    for obj_id, data in self.recent_plates.items():
-                        if data.get('image_hash') == img_hash:
-                            self.cache_hits += 1
-                            plate_number = data['plate_number']
-                            province = data['province']
-                            
-                            # Update cache for current object
-                            if object_id:
-                                self.recent_plates[object_id] = {
-                                    'plate_number': plate_number,
-                                    'province': province,
-                                    'timestamp': time.time(),
-                                    'image_hash': img_hash
-                                }
-                                
-                            logging.info(f"Hash match for image: {plate_number} {province}")
-                            return plate_number, province
             
             # Ensure image is in correct format for the model
             input_image = image
@@ -310,8 +237,7 @@ class OCRPlate:
                         self.recent_plates[object_id] = {
                             'plate_number': plate_number,
                             'province': province if province else "Unknown",  # Ensure province is never None
-                            'timestamp': time.time(),
-                            'image_hash': img_hash
+                            'timestamp': time.time()
                         }
                         
                         # Maintain cache size

@@ -29,7 +29,7 @@ class PlateDetector:
         self.detection_times = []
         
         # Adaptive parameters
-        self.confidence_threshold = 0.4  # Start with moderate confidence
+        self.confidence_threshold = 0.1  # Start with moderate confidence
         self.last_plates = {}  # Cache of recent plate regions by object_id
         self.max_cache_size = 100
         self.backlog = 0  # Track processing backlog
@@ -105,7 +105,7 @@ class PlateDetector:
             img_width, img_height = image.size
             
             # Expand ROI by 20%
-            margin = 0.2
+            margin = 3.0
             x1, y1, x2, y2 = prev_box
             width, height = x2 - x1, y2 - y1
             
