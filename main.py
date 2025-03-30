@@ -743,7 +743,7 @@ def main():
         global plate_weight, ocr_weight, default_rtsp_url
         
         # Determine optimal number of worker threads
-        worker_threads = max(16, min(2, psutil.cpu_count(logical=False) - 1))
+        worker_threads = max(20, min(2, psutil.cpu_count(logical=False) - 1))
         logging.info(f"Using {worker_threads} worker threads for processing")
         
         processing_pipeline = PlateProcessingPipeline(

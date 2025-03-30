@@ -87,10 +87,13 @@ class RTSPFrameReader(threading.Thread):
             transport = "tcp"
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
                 f"rtsp_transport;{transport}|"
-                "buffer_size;16384|"
-                "max_delay;0|"
-                "stimeout;2000000|"
-                "reorder_queue_size;0"
+                "buffer_size;512|"         # Smaller buffer to reduce delay.
+                "max_delay;0|"             # No extra delay.
+                "stimeout;1000000|"        # Shorter timeout in microseconds.
+                "reorder_queue_size;0|"    # Disable packet reordering.
+                "fflags;nobuffer|"         # Disable additional buffering.
+                "analyzeduration;0|"       # Skip duration analysis.
+                "probesize;32"             # Minimal probe size to accelerate startup.
             )
             
             self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
