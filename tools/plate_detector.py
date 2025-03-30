@@ -35,44 +35,6 @@ class PlateDetector:
         self.backlog = 0  # Track processing backlog
         
         logging.info(f"Plate detector initialized on {self.device} device")
-
-    def _calculate_brightness_contrast(self, image):
-        """Calculate brightness and contrast of image"""
-        if isinstance(image, Image.Image):
-            # Convert PIL to numpy for analysis
-            np_image = np.array(image.convert('L'))  # Convert to grayscale
-        else:
-            # Convert OpenCV BGR to grayscale
-            np_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            
-        # Calculate brightness and contrast
-        brightness = np.mean(np_image)
-        contrast = np.std(np_image)
-        return brightness, contrast
-    
-    def _early_rejection(self, image):
-        """Quickly check if image is suitable for plate detection"""
-        brightness, contrast = self._calculate_brightness_contrast(image)
-        
-        # Reject too dark or low contrast images
-        if brightness < 30:
-            return False, "Too dark"
-        if contrast < 15:
-            return False, "Low contrast"
-        
-        return True, "Image acceptable"
-    
-    def set_backlog(self, backlog_count):
-        """Update processing backlog to adjust detection parameters"""
-        self.backlog = backlog_count
-        
-        # Adjust confidence threshold based on backlog
-        if backlog_count > 10:
-            self.confidence_threshold = 0.5  # Higher confidence to speed up
-        elif backlog_count > 5:
-            self.confidence_threshold = 0.45
-        else:
-            self.confidence_threshold = 0.4  # Normal operation
     
     def detect_plate(self, image, object_id=None, event_data=None):
         """
@@ -88,13 +50,6 @@ class PlateDetector:
                 image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
             except Exception as e:
                 logging.error(f"Failed to convert image format: {e}")
-                return None
-        
-        # Apply early rejection if system is under load
-        if self.backlog > 3:
-            suitable, reason = self._early_rejection(image)
-            if not suitable:
-                logging.info(f"Early rejection: {reason}")
                 return None
         
         # Use region of interest from prior detections
@@ -128,7 +83,7 @@ class PlateDetector:
                         roi_image,
                         device=self.device,
                         verbose=False,
-                        conf=self.confidence_threshold,
+                        conf=0.25,
                         half=True
                     )
                     
@@ -169,7 +124,7 @@ class PlateDetector:
                 image, 
                 device=self.device,
                 verbose=False,
-                conf=self.confidence_threshold,
+                conf=0.25, 
                 half=True
             )
             
@@ -221,18 +176,15 @@ class PlateDetector:
         }
         return stats
 
-    # Add this method to handle batched detection from multiple frames
-
     def detect_plate_multiframe(self, frames, object_id=None, event_data=None):
         """
         Detect license plate across multiple sequential frames
-        Returns the best detected plate image or None
+        Returns the first successfully detected plate image or None
         """
         if not frames or len(frames) == 0:
             return None
             
         start_time = time.time()
-        results = []
         
         # Process up to 3 frames maximum for efficiency
         process_frames = frames[:min(3, len(frames))]
@@ -246,37 +198,20 @@ class PlateDetector:
                 except Exception as e:
                     logging.error(f"Failed to convert image format: {e}")
                     continue
-            
-            # Apply early rejection for efficiency 
-            suitable, reason = self._early_rejection(frame)
-            if not suitable:
-                continue
-                
+                    
             # Use the optimized ROI detection if we have prior info
             plate_img = self.detect_plate(frame, object_id, event_data)
             
             if plate_img is not None:
-                # Assess quality of plate image
-                brightness, contrast = self._calculate_brightness_contrast(plate_img)
-                quality_score = min(100, contrast * 0.8 + brightness * 0.2)
-                
-                results.append((plate_img, quality_score))
+                processing_time = time.time() - start_time
+                logging.info(f"Multi-frame detection completed in {processing_time*1000:.1f}ms")
+                return plate_img
         
-        # Return the highest quality plate image
-        if results:
-            best_plate, _ = max(results, key=lambda x: x[1])
-            processing_time = time.time() - start_time
-            
-            logging.info(f"Multi-frame detection completed in {processing_time*1000:.1f}ms, "
-                        f"processed {len(process_frames)} frames, found {len(results)} plates")
-                        
-            return best_plate
+        # If no plates found in multiple frames, try traditional single-frame detection
+        # on the middle frame (usually has better quality)
+        middle_idx = len(process_frames) // 2
+        
+        if middle_idx < len(process_frames):
+            return self.detect_plate(process_frames[middle_idx], object_id, event_data)
         else:
-            # If no plates found in multiple frames, try traditional single-frame detection
-            # on the middle frame (usually has better quality)
-            middle_idx = len(process_frames) // 2
-            
-            if middle_idx < len(process_frames):
-                return self.detect_plate(process_frames[middle_idx], object_id, event_data)
-            else:
-                return None
+            return None

@@ -95,25 +95,6 @@ class OCRPlate:
         except Exception as e:
             logging.warning(f"Error mapping province name for ID {class_id}: {e}")
             return 'Unknown'
-        
-    @lru_cache(maxsize=50)
-    def _cache_predict(self, image_hash):
-        """Cache prediction results based on image hash"""
-        # This is a placeholder as we can't directly cache image processing
-        # The real caching happens in predict() with image hashing
-        pass
-    
-    def set_backlog(self, backlog_count):
-        """Update processing backlog to adjust OCR parameters"""
-        self.backlog = backlog_count
-        
-        # Adjust confidence threshold based on backlog
-        if backlog_count > 10:
-            self.confidence_threshold = 0.4  # Higher confidence to speed up
-        elif backlog_count > 5:
-            self.confidence_threshold = 0.35
-        else:
-            self.confidence_threshold = 0.3  # Normal operation
     
     def predict(self, image, object_id=None):
         """Predict license plate number and province with caching and optimization"""
@@ -164,7 +145,7 @@ class OCRPlate:
                 input_image, 
                 device=self.device, 
                 verbose=False,
-                conf=self.confidence_threshold,
+                conf=0.1,
                 half=True
             )
             
