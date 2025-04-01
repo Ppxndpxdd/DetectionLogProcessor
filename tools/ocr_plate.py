@@ -53,7 +53,7 @@ class OCRPlate:
         self.recent_plates = {}  # Cache recently seen plates by object_id
         
         # Adaptive parameters
-        self.confidence_threshold = 0.1  # Start with moderate confidence
+        self.confidence_threshold = 0.15  # Start with moderate confidence
         self.backlog = 0  # Track processing backlog
         
         logging.info(f"OCR Plate initialized on {self.device} device")
@@ -145,7 +145,7 @@ class OCRPlate:
                 input_image, 
                 device=self.device, 
                 verbose=False,
-                conf=0.1,
+                conf=self.confidence_threshold,
                 half=True
             )
             
