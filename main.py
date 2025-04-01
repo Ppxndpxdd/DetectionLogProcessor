@@ -300,7 +300,7 @@ class PlateProcessingPipeline:
         self.ocr_plate = OCRPlate(ocr_model_path)
         
         # Create OCR processor pool for handling the OCR bottleneck
-        ocr_threads = max(16, min(3, psutil.cpu_count(logical=False)))
+        ocr_threads = max(20, min(3, psutil.cpu_count(logical=False)))
         self.ocr_pool = OCRProcessorPool(num_workers=ocr_threads, ocr_instance=self.ocr_plate)
         
         # Start worker threads
@@ -509,16 +509,16 @@ class PlateProcessingPipeline:
                         # Ensure we're using the right camera stream
                         update_rtsp_reader_for_marker(marker_id)
                     
-                    # Update adaptive parameters
-                    backlog_count = frame_buffer.get_stats()['unprocessed']
-                    self.plate_detector.set_backlog(backlog_count)
-                    self.ocr_plate.set_backlog(backlog_count)
+                    # # Update adaptive parameters
+                    # backlog_count = frame_buffer.get_stats()['unprocessed']
+                    # self.plate_detector.set_backlog(backlog_count)
+                    # self.ocr_plate.set_backlog(backlog_count)
                     
-                    # Skip old frames during high load
-                    frame_age = time.time() - timestamp
-                    if backlog_count > 10 and frame_age > 2.0:
-                        logging.warning(f"Skipping old frame ({frame_age:.1f}s) due to backlog ({backlog_count})")
-                        continue
+                    # # Skip old frames during high load
+                    # frame_age = time.time() - timestamp
+                    # if backlog_count > 10 and frame_age > 2.0:
+                    #     logging.warning(f"Skipping old frame ({frame_age:.1f}s) due to backlog ({backlog_count})")
+                    #     continue
                     
                     # Convert to PIL format for detection
                     pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
