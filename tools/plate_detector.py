@@ -34,7 +34,28 @@ class PlateDetector:
         self.max_cache_size = 100
         self.backlog = 0  # Track processing backlog
         
+        # Blur parameters
+        self.blur_kernel_size = (7, 7)  # Size of the blur kernel
+        self.blur_sigma = 1.5  # Sigma value for Gaussian blur
+        
         logging.info(f"Plate detector initialized on {self.device} device")
+    
+    def apply_blur_postprocessing(self, image):
+        """Apply Gaussian blur to the plate image after detection"""
+        try:
+            # Convert PIL Image to numpy array for OpenCV processing
+            img_np = np.array(image)
+            
+            # Apply Gaussian blur
+            blurred = cv2.GaussianBlur(img_np, self.blur_kernel_size, self.blur_sigma)
+            
+            # Convert back to PIL Image
+            blurred_pil = Image.fromarray(blurred)
+            
+            return blurred_pil
+        except Exception as e:
+            logging.error(f"Error applying blur postprocessing: {e}")
+            return image  # Return original image if blur fails
     
     def detect_plate(self, image, object_id=None, event_data=None):
         """
@@ -43,7 +64,7 @@ class PlateDetector:
         """
         start_time = time.time()
         
-        # Ensure image is in PIL format
+        # Ensure image is in PIL format - minimal conversion needed for model
         if not isinstance(image, Image.Image):
             try:
                 # Convert from OpenCV
@@ -52,80 +73,14 @@ class PlateDetector:
                 logging.error(f"Failed to convert image format: {e}")
                 return None
         
-        # Use region of interest from prior detections
-        roi = None
-        if object_id and object_id in self.last_plates:
-            # Get previous detection region
-            prev_box = self.last_plates[object_id]['box']
-            img_width, img_height = image.size
-            
-            # Expand ROI by 20%
-            margin = 3.0
-            x1, y1, x2, y2 = prev_box
-            width, height = x2 - x1, y2 - y1
-            
-            # Apply margin while keeping within image bounds
-            x1_roi = max(0, int(x1 - width * margin))
-            y1_roi = max(0, int(y1 - height * margin))
-            x2_roi = min(img_width, int(x2 + width * margin))
-            y2_roi = min(img_height, int(y2 + height * margin))
-            
-            roi = (x1_roi, y1_roi, x2_roi, y2_roi)
-            
-            # Apply ROI if it's a reasonable size
-            if (x2_roi - x1_roi) > 50 and (y2_roi - y1_roi) > 20:
-                # Crop image to ROI for faster processing
-                roi_image = image.crop((x1_roi, y1_roi, x2_roi, y2_roi))
-                
-                # Run detection on ROI
-                try:
-                    roi_result = self.model.predict(
-                        roi_image,
-                        device=self.device,
-                        verbose=False,
-                        conf=0.25,
-                        half=True
-                    )
-                    
-                    if roi_result[0].boxes.xyxy.shape[0] > 0:
-                        # Found plate in ROI
-                        x1r, y1r, x2r, y2r = map(int, roi_result[0].boxes.xyxy[0])
-                        
-                        # Convert ROI coordinates back to full image
-                        x1 = x1r + x1_roi
-                        y1 = y1r + y1_roi
-                        x2 = x2r + x1_roi
-                        y2 = y2r + y1_roi
-                        
-                        # Update cache
-                        self.last_plates[object_id] = {
-                            'box': (x1, y1, x2, y2),
-                            'timestamp': time.time()
-                        }
-                        
-                        # Maintain cache size
-                        if len(self.last_plates) > self.max_cache_size:
-                            oldest_key = min(self.last_plates.keys(), 
-                                           key=lambda k: self.last_plates[k]['timestamp'])
-                            del self.last_plates[oldest_key]
-                        
-                        cropped_plate = image.crop((x1, y1, x2, y2))
-                        self.total_detections += 1
-                        self.detection_times.append(time.time() - start_time)
-                        return cropped_plate
-                    
-                    # If ROI fails, fall back to full image detection
-                except Exception as e:
-                    logging.warning(f"ROI detection failed, falling back to full image: {e}")
-        
-        # Run detection on full image
+        # Run detection on full image - no ROI preprocessing
         try:
             result = self.model.predict(
                 image, 
                 device=self.device,
                 verbose=False,
                 conf=0.25, 
-                half=True
+                half=False  # Disabled half-precision
             )
             
             # Check if any plates detected
@@ -136,6 +91,9 @@ class PlateDetector:
                 
                 x1, y1, x2, y2 = map(int, result[0].boxes.xyxy[best_idx])
                 cropped_plate = image.crop((x1, y1, x2, y2))
+                
+                # # Apply blur postprocessing to the cropped plate
+                # processed_plate = self.apply_blur_postprocessing(cropped_plate)
                 
                 # Cache this detection if object_id provided
                 if object_id:
@@ -199,16 +157,14 @@ class PlateDetector:
                     logging.error(f"Failed to convert image format: {e}")
                     continue
                     
-            # Use the optimized ROI detection if we have prior info
             plate_img = self.detect_plate(frame, object_id, event_data)
             
             if plate_img is not None:
                 processing_time = time.time() - start_time
                 logging.info(f"Multi-frame detection completed in {processing_time*1000:.1f}ms")
-                return plate_img
+                return plate_img, 
         
-        # If no plates found in multiple frames, try traditional single-frame detection
-        # on the middle frame (usually has better quality)
+        # If no plates found in multiple frames, try one more frame
         middle_idx = len(process_frames) // 2
         
         if middle_idx < len(process_frames):
